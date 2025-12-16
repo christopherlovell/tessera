@@ -1,0 +1,93 @@
+# Define the system of units to use internally. 
+InternalUnitSystem:
+  UnitMass_in_cgs:     1.98841e43    # 10^10 M_sun
+  UnitLength_in_cgs:   3.08567758e24 # 1 Mpc
+  UnitVelocity_in_cgs: 1e5           # 1 km/s
+  UnitCurrent_in_cgs:  1             # Amperes
+  UnitTemp_in_cgs:     1             # Kelvin
+
+Cosmology:
+  Omega_cdm:      0.2610    # match DM-only ICs (no baryons)
+  Omega_lambda:   0.6901
+  Omega_b:        0.0489
+  h:              0.67742
+  a_begin:        0.04         # z_ini = 24
+  a_end:          1.0          # z_end = 0.
+
+# Parameters governing the time integration
+TimeIntegration:
+  dt_min:     1e-6 
+  dt_max:     1e-2 
+
+# Parameters for the self-gravity scheme
+Gravity:
+  eta:          0.025
+  MAC:          adaptive
+  theta_cr:     0.7
+  epsilon_fmm:  0.001
+  comoving_DM_softening:     0.023     # ~1/25th of mean separation for 50 Mpc/h box
+  max_physical_DM_softening: 0.023
+  mesh_side_length:       1024
+  softening_ratio_background:    0.04   # 1/25th of mean inter-particle separation
+
+# Parameters governing the snapshots
+Snapshots:
+  basename:            snap
+  output_list_on:      1
+  output_list:         output_times.txt
+  compression:         4
+  invoke_ps:           1
+
+# Parameters governing the conserved quantities statistics
+Statistics:
+  delta_time:          10.0
+  scale_factor_first:  1.0
+  
+Scheduler:
+  max_top_level_cells: 8
+  cell_split_size:     50
+  
+# Parameters related to the initial conditions
+InitialConditions:
+  file_name:                   /cosma7/data/dp004/dc-love2/codes/pmwd_zoom_selection/data/music2_ICs_zoom.hdf5
+  periodic:                    1
+  cleanup_h_factors:           0    
+  cleanup_velocity_factors:    0  
+
+# Structure finding options
+StructureFinding:
+  disabled:             1
+
+# Power spectrum calculation options
+PowerSpectrum:
+  grid_side_length: 128
+  num_folds: 4
+  fold_factor: 2
+  window_order: 2
+  requested_spectra: ["matter-matter"]
+
+# Parameters governing the CSDS snapshot system
+CSDS:
+  delta_step:           10       # Update the particle log every this many updates
+  basename:             csds_index  # Common part of the filenames
+  initial_buffer_size:  0.3      # (Optional) Buffer size in GB
+  buffer_scale:	        2       # (Optional) When buffer size is too small, update it with required memory times buffer_scale
+
+
+# Parameters defining a zoom region (only used for running zoom simulations with --zoom runtime flag)
+ZoomRegion:
+  region_pad_factor:          1.1    # How much larger the zoom region will be than the high res particle distribution in the ICs?
+  zoom_top_level_depth:       2     # The depth of the zoom top level cells in a single background cell.
+  bkg_top_level_cells:        16     # How many cells should the background be resolved with? (This is treated as gospel)
+  buffer_cell_depth:          0      # (Optional, only used when buffer cells are needed) The depth of the top level buffer cells in a single background cell. (default: 0)
+  neighbour_max_tree_depth:   2      # (Optional) The depth of the cell trees neighbouring the zoom region (default: -1)
+  bkg_subdepth_diff_grav:     3      # The minimum difference between the leaf depth and the task depth for background cells.
+  max_com_dx:                 0.1    # (Optional) The maximum allowed displacement of the centre of mass of the zoom region from the centre of the box in units of the zoom region extent. When this is exceeded, we rebuild the zoom region.
+
+FOF:
+  basename:             fof
+  linking_length_ratio: 0.2
+  min_group_size:       20
+  linking_types:                   [0, 1, 0, 0, 0, 0, 0]  # Which particle types to consider for linking    (here only DM)
+  attaching_types:                 [1, 0, 0, 0, 1, 1, 0]  # Which particle types to consider for attaching  (here gas, stars, and BHs)
+  seed_black_holes_enabled:        0           # Do not seed black holes when running FOF
