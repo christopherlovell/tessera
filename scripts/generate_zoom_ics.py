@@ -24,6 +24,47 @@ import matplotlib.pyplot as plt
 
 ROOT = Path(__file__).resolve().parent.parent
 
+def _first_existing(*candidates: Path) -> Path | None:
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
+def _resolve_in_run_dir(p: Path | None, run_dir: Path) -> Path | None:
+    if p is None:
+        return None
+    if p.is_absolute():
+        return p
+    run_dir = run_dir.resolve()
+    candidate = (run_dir / p).resolve()
+    try:
+        candidate.relative_to(run_dir)
+    except ValueError:
+        # Prevent `../` from escaping the run directory.
+        candidate = run_dir / p.name
+    return candidate
+
+
+DEFAULT_PARENT_CONFIG = _first_existing(
+    ROOT / "configs" / "music2_parent_tessera.conf",
+    ROOT / "tessera" / "music2_parent_tessera.conf",
+)
+DEFAULT_SUBMIT_SCRIPT = _first_existing(
+    ROOT / "scripts" / "submit_zoom.slurm",
+    ROOT / "scripts" / "submit_swift_zoom.slurm",
+    ROOT / "tessera" / "submit_zoom.slurm",
+    ROOT / "tessera" / "submit_swift_zoom.slurm",
+)
+DEFAULT_MUSIC2_HELPER = _first_existing(
+    ROOT / "scripts" / "generate_music2_ics.sh",
+    ROOT / "tessera" / "generate_music2_ics.sh",
+)
+DEFAULT_OUTPUT_TIMES = _first_existing(
+    ROOT / "configs" / "output_times.txt",
+    ROOT / "tessera" / "output_times.txt",
+)
+
 # Prefer the shared utilities in pmwd_zoom_selection.
 PMWD_SCRIPTS_DIR = Path("/cosma7/data/dp004/dc-love2/codes/pmwd_zoom_selection/scripts")
 if not PMWD_SCRIPTS_DIR.exists():
@@ -92,7 +133,7 @@ def plot_selection(
     fig, axes = plt.subplots(2, 3, figsize=(12, 8), constrained_layout=True)
     planes = [(0, 1, "x", "y"), (0, 2, "x", "z"), (1, 2, "y", "z")]
     slab_axes = [2, 1, 0]  # depth axis for XY, XZ, YZ
-    plot_fov = 75.0  # Mpc, symmetric limits around zoom center
+    plot_fov = 75.0  # Mpc, fallback if no points plotted
 
     def draw_bbox(ax, i, j):
         rect = np.array(
@@ -117,6 +158,23 @@ def plot_selection(
             )
             ax.plot(rect_raw[:, 0], rect_raw[:, 1], color="k", lw=0.8, ls="--", alpha=0.8)
 
+    def set_limits_from_points(ax, pts2d: np.ndarray, *, pad_frac: float = 0.03, min_pad: float = 1.0) -> None:
+        if pts2d.size == 0:
+            ax.set_xlim(-plot_fov, plot_fov)
+            ax.set_ylim(-plot_fov, plot_fov)
+            return
+        xs = pts2d[:, 0]
+        ys = pts2d[:, 1]
+        xmin = float(np.min(xs))
+        xmax = float(np.max(xs))
+        ymin = float(np.min(ys))
+        ymax = float(np.max(ys))
+        rx = xmax - xmin
+        ry = ymax - ymin
+        pad = max(min_pad, pad_frac * max(rx, ry, 1e-12))
+        ax.set_xlim(xmin - pad, xmax + pad)
+        ax.set_ylim(ymin - pad, ymax + pad)
+
     def draw_row(
         row_axes,
         title,
@@ -128,24 +186,28 @@ def plot_selection(
         draw_box: bool,
         draw_haloes: bool = True,
     ):
-        # Keep the view focused around the zoom region (requested), while ensuring the IC bbox fits.
-        bbox_fov = float(np.max(np.abs(np.vstack([mins, maxs])))) * 1.05
-        fov = max(plot_fov, bbox_fov)
         for proj, (ax, (i, j, xi, yi)) in enumerate(zip(row_axes, planes)):
             k = slab_axes[proj]
             env_mask = np.abs(env_pts[:, k]) <= slab_half
-            ax.scatter(env_pts[env_mask, i], env_pts[env_mask, j], s=0.3, alpha=0.1, color="gray", rasterized=True)
-            ax.scatter(box_pts[:, i], box_pts[:, j], s=0.5, alpha=0.15, color="tab:blue", rasterized=True)
-            ax.scatter(sel_pts[:, i], sel_pts[:, j], s=2.0, alpha=0.7, color="tab:orange", rasterized=True)
+            env_xy = env_pts[env_mask][:, [i, j]]
+            box_xy = box_pts[:, [i, j]]
+            sel_xy = sel_pts[:, [i, j]]
+            ax.scatter(env_xy[:, 0], env_xy[:, 1], s=0.3, alpha=0.1, color="gray", rasterized=True)
+            ax.scatter(box_xy[:, 0], box_xy[:, 1], s=0.5, alpha=0.15, color="tab:blue", rasterized=True)
+            ax.scatter(sel_xy[:, 0], sel_xy[:, 1], s=2.0, alpha=0.7, color="tab:orange", rasterized=True)
+
+            lim_pts = [env_xy, box_xy, sel_xy]
             if halo_ic_pts is not None and halo_ic_pts.size:
+                halo_ic_xy = halo_ic_pts[:, [i, j]]
                 ax.scatter(
-                    halo_ic_pts[:, i],
-                    halo_ic_pts[:, j],
+                    halo_ic_xy[:, 0],
+                    halo_ic_xy[:, 1],
                     s=0.8,
                     alpha=0.5,
                     color="tab:green",
                     rasterized=True,
                 )
+                lim_pts.append(halo_ic_xy)
             if draw_haloes and halo_rel is not None and halo_masses is not None:
                 hm = np.asarray(halo_masses, dtype=np.float64)
                 hr = np.asarray(halo_rel, dtype=np.float64)
@@ -154,19 +216,21 @@ def plot_selection(
                     # slab cut for haloes too (by the same depth axis)
                     hslab = mcut & (np.abs(hr[:, k]) <= slab_half)
                     if np.any(hslab):
+                        hr_xy = hr[hslab][:, [i, j]]
                         logm = np.log10(hm[hslab])
                         lo, hi = np.percentile(logm, [5, 99.5]) if logm.size > 5 else (logm.min(), logm.max())
                         lo = float(lo)
                         hi = float(hi if hi > lo else lo + 1e-6)
                         sizes = 10.0 + 150.0 * (np.clip(logm, lo, hi) - lo) / (hi - lo)
                         ax.scatter(
-                            hr[hslab, i],
-                            hr[hslab, j],
+                            hr_xy[:, 0],
+                            hr_xy[:, 1],
                             s=sizes,
                             alpha=0.35,
                             color="tab:purple",
                             rasterized=True,
                         )
+                        lim_pts.append(hr_xy)
             # Overlay “failed” haloes (subset) on top for debugging.
             if draw_haloes and halo_failed_rel is not None and halo_failed_masses is not None:
                 fh = np.asarray(halo_failed_masses, dtype=np.float64)
@@ -174,14 +238,15 @@ def plot_selection(
                 # Do NOT slab-cut failed haloes: the failure is a 3D containment issue and the
                 # halo centre can project misleadingly; always show them in every projection.
                 if fr.size:
+                    fr_xy = fr[:, [i, j]]
                     flogm = np.log10(np.maximum(fh, 1.0))
                     flo, fhi = np.percentile(flogm, [5, 99.5]) if flogm.size > 5 else (flogm.min(), flogm.max())
                     flo = float(flo)
                     fhi = float(fhi if fhi > flo else flo + 1e-6)
                     fsizes = 30.0 + 220.0 * (np.clip(flogm, flo, fhi) - flo) / (fhi - flo)
                     ax.scatter(
-                        fr[:, i],
-                        fr[:, j],
+                        fr_xy[:, 0],
+                        fr_xy[:, 1],
                         s=fsizes,
                         alpha=0.9,
                         color="tab:green",
@@ -189,6 +254,7 @@ def plot_selection(
                         linewidths=1.2,
                         rasterized=True,
                     )
+                    lim_pts.append(fr_xy)
             # Draw the kernel radius (and boundary band) in z=0 panels for visual debugging.
             if draw_haloes and kernel_radius is not None:
                 import matplotlib.patches as mpatches
@@ -200,10 +266,16 @@ def plot_selection(
                     r_out = float(kernel_radius) + float(kernel_boundary_L)
                     ax.add_patch(mpatches.Circle((0.0, 0.0), r_in, fill=False, lw=0.8, ls=":", color="k", alpha=0.5))
                     ax.add_patch(mpatches.Circle((0.0, 0.0), r_out, fill=False, lw=0.8, ls=":", color="k", alpha=0.5))
+                    # Make sure the boundary circle isn't clipped too aggressively.
+                    lim_pts.append(np.array([[-r_out, -r_out], [r_out, r_out]], dtype=np.float64))
             if draw_box:
                 draw_bbox(ax, i, j)
-            ax.set_xlim(-fov, fov)
-            ax.set_ylim(-fov, fov)
+                # Keep bbox overlays visible even if the plotted sample misses the edges.
+                lim_pts.append(np.array([[mins[i], mins[j]], [maxs[i], maxs[j]]], dtype=np.float64))
+                if mins_raw is not None and maxs_raw is not None:
+                    lim_pts.append(np.array([[mins_raw[i], mins_raw[j]], [maxs_raw[i], maxs_raw[j]]], dtype=np.float64))
+
+            set_limits_from_points(ax, np.vstack([p for p in lim_pts if p.size]))
             ax.set_xlabel(f"{xi} - center")
             ax.set_ylabel(f"{yi} - center")
             ax.set_aspect("equal")
@@ -511,7 +583,7 @@ def main():
     ap.add_argument(
         "--parent-config",
         type=Path,
-        default=ROOT / "tessera" / "music2_parent_tessera.conf",
+        default=DEFAULT_PARENT_CONFIG,
         help="Tessera parent MUSIC2 config.",
     )
     ap.add_argument(
@@ -520,25 +592,47 @@ def main():
         default=ROOT / "configs" / "music2_zoom.conf",
         help="MUSIC2 zoom template.",
     )
-    ap.add_argument("--out-config", type=Path, help="Output MUSIC2 zoom config path (default: <out-base>/<idx>/music2_zoom.conf).")
+    ap.add_argument(
+        "--out-config",
+        type=Path,
+        help=(
+            "Output MUSIC2 zoom config path. If relative, it is interpreted inside the run directory. "
+            "Default: <out-base>/<idx>/music2_zoom_<idx>.conf; also copies to music2_zoom.conf."
+        ),
+    )
     ap.add_argument("--levelmin", type=int, help="Zoom levelmin (defaults to parent levelmin).")
     ap.add_argument("--levelmax", type=int, required=True, help="Zoom levelmax (finest resolution).")
-    ap.add_argument("--out-ics", type=Path, help="Output ICs path in MUSIC2 config (default: <out-base>/<idx>/zoom_ICS_<idx>.hdf5).")
-    ap.add_argument("--plot-out", type=Path, help="PNG plot path (default: <out-base>/<idx>/zoom_ICs_<idx>.png).")
+    ap.add_argument(
+        "--out-ics",
+        type=Path,
+        help=(
+            "Output ICs path in MUSIC2 config. If relative, it is interpreted inside the run directory. "
+            "Default: <out-base>/<idx>/zoom_ICS_<idx>.hdf5."
+        ),
+    )
+    ap.add_argument(
+        "--plot-out",
+        type=Path,
+        help=(
+            "PNG plot path. If relative, it is interpreted inside the run directory. "
+            "Default: <out-base>/<idx>/zoom_ICs_<idx>.png."
+        ),
+    )
     ap.add_argument("--fof", type=Path, help="Optional SWIFT-style FOF catalogue (to overlay halo centres).")
     ap.add_argument("--halo-mmin", type=float, default=1e4, help="Minimum halo mass to plot (1e10 Msun).")
     ap.add_argument("--halo-boundary", type=float, default=2.5, help="Boundary buffer L (Mpc).")
     ap.add_argument(
         "--swift-template",
         type=Path,
-        default=ROOT / "tessera" / "swift_zoom_params.yaml",
+        default=ROOT / "configs" / "swift_zoom_params.yaml",
         help="SWIFT zoom YAML template to copy into the zoom directory.",
     )
     args = ap.parse_args()
 
     zoom_index = int(args.index) if args.index is not None else next_zoom_index(args.out_base)
-    run_dir = args.out_base / f"{zoom_index:04d}"
+    run_dir = (args.out_base / f"{zoom_index:04d}")
     run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = run_dir.resolve()
     log_path = run_dir / f"generate_zoom_ics_{zoom_index:04d}.txt"
     log_fh = log_path.open("w")
     old_stdout = sys.stdout
@@ -547,9 +641,18 @@ def main():
     atexit.register(lambda: setattr(sys, "stdout", old_stdout))
     atexit.register(log_fh.close)
 
-    out_config = args.out_config or (run_dir / "music2_zoom.conf")
-    out_ics = args.out_ics or (run_dir / f"zoom_ICS_{zoom_index:04d}.hdf5")
-    plot_out = args.plot_out or (run_dir / f"zoom_ICs_{zoom_index:04d}.png")
+    out_config = _resolve_in_run_dir(args.out_config, run_dir) or (run_dir / f"music2_zoom_{zoom_index:04d}.conf")
+    plot_out = _resolve_in_run_dir(args.plot_out, run_dir) or (run_dir / f"zoom_ICs_{zoom_index:04d}.png")
+
+    # Always place the MUSIC2 IC output inside the run directory (only allow overriding the basename).
+    out_ics_name = args.out_ics.name if args.out_ics is not None else f"zoom_ICS_{zoom_index:04d}.hdf5"
+    out_ics = run_dir / out_ics_name
+
+    if args.parent_config is None:
+        raise FileNotFoundError(
+            "Could not find default parent MUSIC2 config; pass --parent-config. "
+            f"Tried: {ROOT / 'configs' / 'music2_parent_tessera.conf'} and {ROOT / 'tessera' / 'music2_parent_tessera.conf'}"
+        )
 
     parent_cfg = configparser.ConfigParser()
     parent_cfg.optionxform = str
@@ -816,10 +919,13 @@ def main():
     print(f"  High-res particles in bounding-box volume (if fully filled): ~{n_high_in_box:,.0f} ({n_high_in_box**(1/3):.1f}^3)")
     print(f"  Bounding-box particle count (parent IC): {n_box_particles:,}")
     print(f"  Bounding-box mass (parent IC): {mass_box:.6e} (10^10 Msun)")
-    abs_min = (center + mins) % parent_box
-    abs_max = (center + maxs) % parent_box
-    extent_abs = (abs_max - abs_min) % parent_box
-    center_abs = (abs_min + 0.5 * extent_abs) % parent_box
+    # Coordinates coming from SWIFT-format HDF5 snapshots are in Mpc (Header.BoxSize units),
+    # while MUSIC2 config `boxlength` is in Mpc/h. Use the parent IC Header.BoxSize for
+    # periodic wrapping and compute dimensionless fractions accordingly in `write_music_zoom_config`.
+    abs_min = (center + mins) % box_ic
+    abs_max = (center + maxs) % box_ic
+    extent_abs = (abs_max - abs_min) % box_ic
+    center_abs = (abs_min + 0.5 * extent_abs) % box_ic
 
     write_music_zoom_config(
         template_path=args.template,
@@ -827,12 +933,26 @@ def main():
         parent_cfg=parent_cfg,
         center_abs=center_abs,
         extent_abs=extent_abs,
-        box_size=parent_box,
+        boxlength_mpc_h=parent_box,
+        coord_box_size=box_ic,
         base_levelmin=base_levelmin,
         base_levelmax=base_levelmax,
         out_ics=out_ics,
     )
     print(f"\nWrote MUSIC2 zoom config to {out_config}")
+
+    # Keep a stable filename for downstream scripts (e.g. submit scripts) while also producing
+    # an index-stamped config for bookkeeping.
+    stable_music2_cfg = run_dir / "music2_zoom.conf"
+    try:
+        if out_config.resolve() != stable_music2_cfg.resolve():
+            shutil.copy2(out_config, stable_music2_cfg)
+            print(f"Copied MUSIC2 zoom config to {stable_music2_cfg}")
+    except FileNotFoundError:
+        # If the user points --out-config somewhere non-existent, resolve() can fail.
+        if out_config != stable_music2_cfg:
+            shutil.copy2(out_config, stable_music2_cfg)
+            print(f"Copied MUSIC2 zoom config to {stable_music2_cfg}")
 
     # Copy/write SWIFT zoom YAML into the run directory, updating cosmology and paths.
     swift_out = run_dir / "swift_zoom_params.yaml"
@@ -850,22 +970,25 @@ def main():
     print(f"Wrote SWIFT zoom params to {swift_out}")
 
     # Copy the SWIFT zoom submission script into the run directory for convenience.
-    submit_tpl = ROOT / "tessera" / "submit_swift_zoom.slurm"
-    if submit_tpl.exists():
-        shutil.copy2(submit_tpl, run_dir / submit_tpl.name)
-        print(f"Copied SWIFT submit script to {run_dir / submit_tpl.name}")
+    if DEFAULT_SUBMIT_SCRIPT is None:
+        print("WARNING: no SWIFT submit script found in repo; not copying to run directory.")
+    else:
+        shutil.copy2(DEFAULT_SUBMIT_SCRIPT, run_dir / DEFAULT_SUBMIT_SCRIPT.name)
+        print(f"Copied SWIFT submit script to {run_dir / DEFAULT_SUBMIT_SCRIPT.name}")
 
     # Copy MUSIC2 helper script for convenience.
-    music2_sh = ROOT / "tessera" / "generate_music2_ics.sh"
-    if music2_sh.exists():
-        shutil.copy2(music2_sh, run_dir / music2_sh.name)
-        print(f"Copied MUSIC2 helper script to {run_dir / music2_sh.name}")
+    if DEFAULT_MUSIC2_HELPER is None:
+        print("WARNING: no MUSIC2 helper script found in repo; not copying to run directory.")
+    else:
+        shutil.copy2(DEFAULT_MUSIC2_HELPER, run_dir / DEFAULT_MUSIC2_HELPER.name)
+        print(f"Copied MUSIC2 helper script to {run_dir / DEFAULT_MUSIC2_HELPER.name}")
 
     # Copy SWIFT output list to the run directory if present (template refers to output_times.txt).
-    out_times = ROOT / "tessera" / "output_times.txt"
-    if out_times.exists():
-        shutil.copy2(out_times, run_dir / out_times.name)
-        print(f"Copied output times to {run_dir / out_times.name}")
+    if DEFAULT_OUTPUT_TIMES is None:
+        print("WARNING: output_times.txt not found in repo; SWIFT may fail if template uses output_list.")
+    else:
+        shutil.copy2(DEFAULT_OUTPUT_TIMES, run_dir / DEFAULT_OUTPUT_TIMES.name)
+        print(f"Copied output times to {run_dir / DEFAULT_OUTPUT_TIMES.name}")
 
     if plot_out:
         make_debug_plot(

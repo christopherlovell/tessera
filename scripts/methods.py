@@ -120,7 +120,27 @@ def write_swift_zoom_yaml(
     if "CSDS" in params and isinstance(params["CSDS"], dict):
         params["CSDS"]["basename"] = str(run_dir / "csds_index")
 
-    out_path.write_text(yaml.safe_dump(params, sort_keys=False))
+    # SWIFT's parameter reader expects some sequences to be written in flow-style (e.g. `[0, 1, 0]`)
+    # rather than block-style dashes. Force flow-style for all YAML sequences.
+    class _SwiftDumper(yaml.SafeDumper):
+        pass
+
+    def _repr_seq(dumper: yaml.SafeDumper, data):
+        return dumper.represent_sequence("tag:yaml.org,2002:seq", data, flow_style=True)
+
+    _SwiftDumper.add_representer(list, _repr_seq)
+    _SwiftDumper.add_representer(tuple, _repr_seq)
+
+    # NOTE: use `yaml.dump` (not `safe_dump`) so we can pass a custom SafeDumper subclass.
+    out_path.write_text(
+        yaml.dump(
+            params,
+            sort_keys=False,
+            Dumper=_SwiftDumper,
+            default_flow_style=False,
+            width=120,
+        )
+    )
 
 
 def write_music_zoom_config(
@@ -129,7 +149,8 @@ def write_music_zoom_config(
     parent_cfg: configparser.ConfigParser,
     center_abs: np.ndarray,
     extent_abs: np.ndarray,
-    box_size: float,
+    boxlength_mpc_h: float,
+    coord_box_size: float,
     base_levelmin: int,
     base_levelmax: int,
     out_ics: Path | None,
@@ -159,15 +180,27 @@ def write_music_zoom_config(
     for lvl in range(parent_levelmax + 1, base_levelmax + 1):
         seeds[f"seed[{lvl}]"] = str(rng.randint(1, 2**31 - 1))
 
-    center_frac = center_abs / box_size
-    extent_frac = extent_abs / box_size
+    # MUSIC2 expects `boxlength` in Mpc/h, while SWIFT-format coordinates/BoxSize are in Mpc.
+    # We therefore express the zoom region in *dimensionless fractions* of the coordinate box
+    # (usually the parent IC file Header.BoxSize), which is consistent regardless of h.
+    center_frac = center_abs / float(coord_box_size)
+    extent_frac = extent_abs / float(coord_box_size)
 
     cfg["setup"]["levelmin"] = str(base_levelmin)
     cfg["setup"]["levelmin_TF"] = str(parent_levelmin)
     cfg["setup"]["levelmax"] = str(base_levelmax)
-    cfg["setup"]["boxlength"] = str(box_size)
+    cfg["setup"]["boxlength"] = str(boxlength_mpc_h)
     cfg["setup"]["ref_center"] = ", ".join(f"{c:.6f}" for c in center_frac)
     cfg["setup"]["ref_extent"] = ", ".join(f"{e:.6f}" for e in extent_frac)
+
+    # Keep cosmology consistent with the parent ICs. This affects the SWIFT Header.BoxSize
+    # (via boxlength/h) and particle masses.
+    if "cosmology" not in cfg:
+        cfg.add_section("cosmology")
+    if "cosmology" in parent_cfg:
+        for key in ("Omega_m", "Omega_b", "Omega_L", "H0", "n_s", "sigma_8", "transfer"):
+            if key in parent_cfg["cosmology"]:
+                cfg["cosmology"][key] = str(parent_cfg["cosmology"][key]).split()[0]
 
     if out_ics is not None:
         cfg["output"]["filename"] = str(out_ics)
@@ -409,4 +442,3 @@ def infer_contiguous_id_offset(ids: np.ndarray) -> int | None:
     if int(tail[-1]) != offset + (n - 1):
         return None
     return offset
-
