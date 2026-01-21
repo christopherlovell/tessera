@@ -1,0 +1,4 @@
+Example command:
+
+python generate_zoom_ics.py --grid /snap7/scratch/dp276/dc-love2/tessera/parent/gridder/gridder_output_512.hdf5 --snap /snap7/scratch/dp276/dc-love2/tessera/parent/snap_0011.hdf5 --ic-snap /snap7/scratch/dp276/dc-love2/tessera/parent/music2_ICs_parent.hdf5 --kernel-index 0 --target-logdelta 0.0 --out-config music2_zoom_0000.conf --parent-config ../configs/music2_parent_tessera.conf --template ../configs/music2_zoom.conf --levelmax 15 --levelmin 7 --target-rank 0
+
