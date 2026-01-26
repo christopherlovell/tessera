@@ -1,35 +1,24 @@
 #!/usr/bin/env python
 """
-Generate a MUSIC2 zoom configuration for the Tessera parent box from a kernel selection.
-
-This is a Tessera-focused copy of `scripts/estimate_zoom_mass.py`:
-  - Defaults to the Tessera parent config (`tessera/music2_parent_tessera.conf`)
-  - Writes a MUSIC2 zoom config (ref_center/ref_extent + levels + seeds)
+Generate a MUSIC2 zoom configuration for the Tessera parent box from a selection sphere.
 
 Inputs:
-  - A gridder output to choose a center based on a kernel overdensity.
-  - A z=0 snapshot with ParticleIDs to select particles within the chosen kernel.
+  - A gridder output to choose a center based on a kernel overdensity (kernel mode), or a SWIFT FOF catalogue (halo mode).
+  - A z=0 snapshot with ParticleIDs to select particles within the chosen sphere.
   - The parent IC file (ParticleIDs + Masses) to trace those particles back to ICs.
 """
 
 import argparse
 import configparser
+import os
 import sys
 from pathlib import Path
 import shutil
 import atexit
 
 import numpy as np
-import matplotlib.pyplot as plt
 
 ROOT = Path(__file__).resolve().parent.parent
-
-def _first_existing(*candidates: Path) -> Path | None:
-    for p in candidates:
-        if p.exists():
-            return p
-    return None
-
 
 def _resolve_in_run_dir(p: Path | None, run_dir: Path) -> Path | None:
     if p is None:
@@ -46,26 +35,13 @@ def _resolve_in_run_dir(p: Path | None, run_dir: Path) -> Path | None:
     return candidate
 
 
-DEFAULT_PARENT_CONFIG = _first_existing(
-    ROOT / "configs" / "music2_parent_tessera.conf",
-    ROOT / "tessera" / "music2_parent_tessera.conf",
-)
-DEFAULT_SUBMIT_SCRIPT = _first_existing(
-    ROOT / "scripts" / "submit_zoom.slurm",
-    ROOT / "scripts" / "submit_swift_zoom.slurm",
-    ROOT / "tessera" / "submit_zoom.slurm",
-    ROOT / "tessera" / "submit_swift_zoom.slurm",
-)
-DEFAULT_MUSIC2_HELPER = _first_existing(
-    ROOT / "scripts" / "generate_music2_ics.sh",
-    ROOT / "tessera" / "generate_music2_ics.sh",
-)
-DEFAULT_OUTPUT_TIMES = _first_existing(
-    ROOT / "configs" / "output_times.txt",
-    ROOT / "tessera" / "output_times.txt",
-)
+DEFAULT_PARENT_CONFIG = ROOT / "configs" / "music2_parent_tessera.conf"
+DEFAULT_SUBMIT_SCRIPT_COSMA7 = ROOT / "scripts" / "submit_zoom_cosma7.slurm"
+DEFAULT_SUBMIT_SCRIPT_COSMA8 = ROOT / "scripts" / "submit_zoom_cosma8.slurm"
+DEFAULT_MUSIC2_HELPER = ROOT / "scripts" / "generate_music2_ics.sh"
+DEFAULT_OUTPUT_TIMES = ROOT / "configs" / "output_times.txt"
+DEFAULT_ZOOM_BASE = Path("/snap8/scratch/dp004/dc-love2/tessera/")
 
-# Prefer the shared utilities in pmwd_zoom_selection.
 PMWD_SCRIPTS_DIR = Path("/cosma7/data/dp004/dc-love2/codes/pmwd_zoom_selection/scripts")
 if not PMWD_SCRIPTS_DIR.exists():
     PMWD_SCRIPTS_DIR = (ROOT.parent / "pmwd_zoom_selection" / "scripts").resolve()
@@ -77,7 +53,7 @@ if not PMWD_SCRIPTS_DIR.exists():
 if str(PMWD_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(PMWD_SCRIPTS_DIR))
 
-from utilities import (  # noqa: E402
+from utilities import (
     bounding_box,
     choose_center,
     kernel_radius_from_gridder,
@@ -88,222 +64,24 @@ from utilities import (  # noqa: E402
     unwrap_relative,
 )
 
-DEFAULT_ZOOM_BASE = Path("/snap7/scratch/dp276/dc-love2/tessera/zooms")
-
-from methods import (  # noqa: E402
+from methods import (
     _Tee,
     _parse_float,
     _parse_int,
-    fof_haloes_relative,
+    iter_existing_zoom_selections,
+    periodic_distance,
+    selection_center_and_radius,
     infer_contiguous_id_offset,
-    infer_id_offset,
+    halo_ic_positions_for_plot,
     load_fof_catalogue,
+    make_debug_plot,
     next_zoom_index,
-    positions_for_ids_by_offset,
-    positions_for_ids_by_scan,
     sample_box_particles,
+    utc_now_iso,
     write_music_zoom_config,
     write_swift_zoom_yaml,
+    write_zoom_selection_metadata,
 )
-
-
-def plot_selection(
-    out_png: Path,
-    sel_ic: np.ndarray,
-    box_ic: np.ndarray,
-    env_ic: np.ndarray,
-    sel_z0: np.ndarray,
-    box_z0: np.ndarray,
-    env_z0: np.ndarray,
-    halo_ic: np.ndarray | None,
-    mins_raw: np.ndarray | None,
-    maxs_raw: np.ndarray | None,
-    mins: np.ndarray,
-    maxs: np.ndarray,
-    slab_half: float,
-    env_half: float,
-    kernel_radius: float | None = None,
-    kernel_boundary_L: float | None = None,
-    halo_rel: np.ndarray | None = None,
-    halo_masses: np.ndarray | None = None,
-    halo_failed_rel: np.ndarray | None = None,
-    halo_failed_masses: np.ndarray | None = None,
-    halo_mmin: float = 1e14,
-) -> None:
-    fig, axes = plt.subplots(2, 3, figsize=(12, 8), constrained_layout=True)
-    planes = [(0, 1, "x", "y"), (0, 2, "x", "z"), (1, 2, "y", "z")]
-    slab_axes = [2, 1, 0]  # depth axis for XY, XZ, YZ
-    plot_fov = 75.0  # Mpc, fallback if no points plotted
-
-    def draw_bbox(ax, i, j):
-        rect = np.array(
-            [
-                [mins[i], mins[j]],
-                [maxs[i], mins[j]],
-                [maxs[i], maxs[j]],
-                [mins[i], maxs[j]],
-                [mins[i], mins[j]],
-            ]
-        )
-        ax.plot(rect[:, 0], rect[:, 1], color="tab:red", lw=1)
-        if mins_raw is not None and maxs_raw is not None:
-            rect_raw = np.array(
-                [
-                    [mins_raw[i], mins_raw[j]],
-                    [maxs_raw[i], mins_raw[j]],
-                    [maxs_raw[i], maxs_raw[j]],
-                    [mins_raw[i], maxs_raw[j]],
-                    [mins_raw[i], mins_raw[j]],
-                ]
-            )
-            ax.plot(rect_raw[:, 0], rect_raw[:, 1], color="k", lw=0.8, ls="--", alpha=0.8)
-
-    def set_limits_from_points(ax, pts2d: np.ndarray, *, pad_frac: float = 0.03, min_pad: float = 1.0) -> None:
-        if pts2d.size == 0:
-            ax.set_xlim(-plot_fov, plot_fov)
-            ax.set_ylim(-plot_fov, plot_fov)
-            return
-        xs = pts2d[:, 0]
-        ys = pts2d[:, 1]
-        xmin = float(np.min(xs))
-        xmax = float(np.max(xs))
-        ymin = float(np.min(ys))
-        ymax = float(np.max(ys))
-        rx = xmax - xmin
-        ry = ymax - ymin
-        pad = max(min_pad, pad_frac * max(rx, ry, 1e-12))
-        ax.set_xlim(xmin - pad, xmax + pad)
-        ax.set_ylim(ymin - pad, ymax + pad)
-
-    def draw_row(
-        row_axes,
-        title,
-        sel_pts,
-        box_pts,
-        env_pts,
-        *,
-        halo_ic_pts: np.ndarray | None,
-        draw_box: bool,
-        draw_haloes: bool = True,
-    ):
-        for proj, (ax, (i, j, xi, yi)) in enumerate(zip(row_axes, planes)):
-            k = slab_axes[proj]
-            env_mask = np.abs(env_pts[:, k]) <= slab_half
-            env_xy = env_pts[env_mask][:, [i, j]]
-            box_xy = box_pts[:, [i, j]]
-            sel_xy = sel_pts[:, [i, j]]
-            ax.scatter(env_xy[:, 0], env_xy[:, 1], s=0.3, alpha=0.1, color="gray", rasterized=True)
-            ax.scatter(box_xy[:, 0], box_xy[:, 1], s=0.5, alpha=0.15, color="tab:blue", rasterized=True)
-            ax.scatter(sel_xy[:, 0], sel_xy[:, 1], s=2.0, alpha=0.7, color="tab:orange", rasterized=True)
-
-            lim_pts = [env_xy, box_xy, sel_xy]
-            if halo_ic_pts is not None and halo_ic_pts.size:
-                halo_ic_xy = halo_ic_pts[:, [i, j]]
-                ax.scatter(
-                    halo_ic_xy[:, 0],
-                    halo_ic_xy[:, 1],
-                    s=0.8,
-                    alpha=0.5,
-                    color="tab:green",
-                    rasterized=True,
-                )
-                lim_pts.append(halo_ic_xy)
-            if draw_haloes and halo_rel is not None and halo_masses is not None:
-                hm = np.asarray(halo_masses, dtype=np.float64)
-                hr = np.asarray(halo_rel, dtype=np.float64)
-                mcut = hm >= halo_mmin
-                if np.any(mcut):
-                    # slab cut for haloes too (by the same depth axis)
-                    hslab = mcut & (np.abs(hr[:, k]) <= slab_half)
-                    if np.any(hslab):
-                        hr_xy = hr[hslab][:, [i, j]]
-                        logm = np.log10(hm[hslab])
-                        lo, hi = np.percentile(logm, [5, 99.5]) if logm.size > 5 else (logm.min(), logm.max())
-                        lo = float(lo)
-                        hi = float(hi if hi > lo else lo + 1e-6)
-                        sizes = 10.0 + 150.0 * (np.clip(logm, lo, hi) - lo) / (hi - lo)
-                        ax.scatter(
-                            hr_xy[:, 0],
-                            hr_xy[:, 1],
-                            s=sizes,
-                            alpha=0.35,
-                            color="tab:purple",
-                            rasterized=True,
-                        )
-                        lim_pts.append(hr_xy)
-            # Overlay “failed” haloes (subset) on top for debugging.
-            if draw_haloes and halo_failed_rel is not None and halo_failed_masses is not None:
-                fh = np.asarray(halo_failed_masses, dtype=np.float64)
-                fr = np.asarray(halo_failed_rel, dtype=np.float64)
-                # Do NOT slab-cut failed haloes: the failure is a 3D containment issue and the
-                # halo centre can project misleadingly; always show them in every projection.
-                if fr.size:
-                    fr_xy = fr[:, [i, j]]
-                    flogm = np.log10(np.maximum(fh, 1.0))
-                    flo, fhi = np.percentile(flogm, [5, 99.5]) if flogm.size > 5 else (flogm.min(), flogm.max())
-                    flo = float(flo)
-                    fhi = float(fhi if fhi > flo else flo + 1e-6)
-                    fsizes = 30.0 + 220.0 * (np.clip(flogm, flo, fhi) - flo) / (fhi - flo)
-                    ax.scatter(
-                        fr_xy[:, 0],
-                        fr_xy[:, 1],
-                        s=fsizes,
-                        alpha=0.9,
-                        color="tab:green",
-                        marker="x",
-                        linewidths=1.2,
-                        rasterized=True,
-                    )
-                    lim_pts.append(fr_xy)
-            # Draw the kernel radius (and boundary band) in z=0 panels for visual debugging.
-            if draw_haloes and kernel_radius is not None:
-                import matplotlib.patches as mpatches
-
-                circ = mpatches.Circle((0.0, 0.0), float(kernel_radius), fill=False, lw=1.0, ls="--", color="k", alpha=0.7)
-                ax.add_patch(circ)
-                if kernel_boundary_L is not None and float(kernel_boundary_L) > 0:
-                    r_in = max(0.0, float(kernel_radius) - float(kernel_boundary_L))
-                    r_out = float(kernel_radius) + float(kernel_boundary_L)
-                    ax.add_patch(mpatches.Circle((0.0, 0.0), r_in, fill=False, lw=0.8, ls=":", color="k", alpha=0.5))
-                    ax.add_patch(mpatches.Circle((0.0, 0.0), r_out, fill=False, lw=0.8, ls=":", color="k", alpha=0.5))
-                    # Make sure the boundary circle isn't clipped too aggressively.
-                    lim_pts.append(np.array([[-r_out, -r_out], [r_out, r_out]], dtype=np.float64))
-            if draw_box:
-                draw_bbox(ax, i, j)
-                # Keep bbox overlays visible even if the plotted sample misses the edges.
-                lim_pts.append(np.array([[mins[i], mins[j]], [maxs[i], maxs[j]]], dtype=np.float64))
-                if mins_raw is not None and maxs_raw is not None:
-                    lim_pts.append(np.array([[mins_raw[i], mins_raw[j]], [maxs_raw[i], maxs_raw[j]]], dtype=np.float64))
-
-            set_limits_from_points(ax, np.vstack([p for p in lim_pts if p.size]))
-            ax.set_xlabel(f"{xi} - center")
-            ax.set_ylabel(f"{yi} - center")
-            ax.set_aspect("equal")
-        row_axes[0].set_title(title)
-
-    draw_row(
-        axes[0, :],
-        "ICs (bbox in red, environment slab in gray)",
-        sel_ic,
-        box_ic,
-        env_ic,
-        halo_ic_pts=halo_ic,
-        draw_box=True,
-        draw_haloes=False,
-    )
-    draw_row(
-        axes[1, :],
-        "z=0 (bbox in red, environment slab in gray)",
-        sel_z0,
-        box_z0,
-        env_z0,
-        halo_ic_pts=None,
-        draw_box=False,
-    )
-
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_png, dpi=200)
-    plt.close(fig)
 
 
 def halo_fully_selected_in_bbox(
@@ -363,205 +141,24 @@ def halo_fully_selected_in_bbox(
     return True
 
 
-def halo_ic_positions_for_plot(
-    *,
-    ids_sim: np.ndarray,
-    pos_sim: np.ndarray,
-    box_sim: float,
-    halo_center: np.ndarray,
-    halo_radius: float,
-    ic_pos: np.ndarray,
-    ic_id_offset: int,
-    box_ic: float,
-    zoom_center: np.ndarray,
-    max_samples: int = 50_000,
-    rng_seed: int = 0,
-) -> np.ndarray:
-    """
-    Sample IC-relative positions of particles within a halo radius at z=0 (for plotting).
-
-    Uses reservoir sampling over halo particles; avoids allocating full-size temporaries.
-    """
-    radius2 = float(halo_radius) ** 2
-    half = 0.5 * float(box_sim)
-    rng = np.random.default_rng(rng_seed)
-
-    n = int(pos_sim.shape[0])
-    chunk = 2_000_000
-    samples: list[np.ndarray] = []
-    seen = 0
-
-    for start in range(0, n, chunk):
-        stop = min(start + chunk, n)
-        pos = pos_sim[start:stop]
-        ids = ids_sim[start:stop].astype(np.int64, copy=False)
-
-        delta = pos - halo_center
-        delta = (delta + half) % float(box_sim) - half
-        dist2 = np.einsum("ij,ij->i", delta, delta)
-        in_halo = dist2 <= radius2
-        if not np.any(in_halo):
-            continue
-
-        halo_ids = ids[in_halo]
-        idx = halo_ids - int(ic_id_offset)
-        ok = (idx >= 0) & (idx < ic_pos.shape[0])
-        if not np.any(ok):
-            continue
-        idx = idx[ok]
-
-        ic_halo_pos = ic_pos[idx]
-        ic_rel = unwrap_relative(ic_halo_pos, zoom_center, box_ic)
-
-        for p in ic_rel:
-            seen += 1
-            if len(samples) < max_samples:
-                samples.append(p)
-            else:
-                j = int(rng.integers(0, seen))
-                if j < max_samples:
-                    samples[j] = p
-
-    return np.array(samples, dtype=np.float64)
-
-
-def make_debug_plot(
-    plot_path: Path,
-    *,
-    center: np.ndarray,
-    box_sim: float,
-    box_ic: float,
-    mins_raw: np.ndarray | None,
-    maxs_raw: np.ndarray | None,
-    mins: np.ndarray,
-    maxs: np.ndarray,
-    sel_pos: np.ndarray,
-    pos_ic_rel: np.ndarray,
-    ic_path: Path,
-    snap_path: Path,
-    fof_path: Path | None,
-    halo_mmin: float,
-    kernel_radius: float | None = None,
-    kernel_boundary_L: float | None = None,
-    failed_halo_centres: np.ndarray | None = None,
-    failed_halo_masses: np.ndarray | None = None,
-    halo_ic: np.ndarray | None = None,
-) -> None:
-    rng = np.random.default_rng(0)
-    max_sel_plot = 50000
-    max_box_plot = 200000
-    max_env_plot = 300000
-
-    sel_ic_plot = pos_ic_rel
-    sel_z0_plot = unwrap_relative(sel_pos, center, box_sim)
-    if sel_ic_plot.shape[0] > max_sel_plot:
-        keep = rng.choice(sel_ic_plot.shape[0], size=max_sel_plot, replace=False)
-        sel_ic_plot = sel_ic_plot[keep]
-        sel_z0_plot = sel_z0_plot[keep]
-
-    box_ids, box_ic_plot, _box_ic_size, _n_box, _m_box = sample_box_particles(
-        ic_path=ic_path,
-        center=center,
-        mins=mins,
-        maxs=maxs,
-        max_samples=max_box_plot,
-        seed=0,
-    )
-    if box_ids.size == 0:
-        raise RuntimeError("No particles found inside the IC-space bounding box to plot.")
-
-    extents = maxs - mins
-    zoom_diameter = float(np.max(extents))
-    slab_half = 0.5 * zoom_diameter
-    env_half = 2.0 * zoom_diameter
-
-    def sample_environment(path: Path, box_size: float) -> np.ndarray:
-        import h5py
-
-        env: list[np.ndarray] = []
-        seen = 0
-        chunk = 2_000_000
-        with h5py.File(path, "r") as f:
-            pos_ds = f["PartType1/Coordinates"]
-            n = int(pos_ds.shape[0])
-            for start in range(0, n, chunk):
-                stop = min(start + chunk, n)
-                pos = np.array(pos_ds[start:stop], dtype=np.float64)
-                rel = unwrap_relative(pos, center, box_size)
-                mask = np.all(np.abs(rel) <= env_half, axis=1)
-                if not np.any(mask):
-                    continue
-                rel = rel[mask]
-                for rpos in rel:
-                    seen += 1
-                    if len(env) < max_env_plot:
-                        env.append(rpos)
-                    else:
-                        j = rng.integers(0, seen)
-                        if j < max_env_plot:
-                            env[j] = rpos
-        return np.array(env, dtype=np.float64)
-
-    env_ic_plot = sample_environment(ic_path, box_ic)
-    env_z0_plot = sample_environment(snap_path, box_sim)
-
-    try:
-        off_z0, _ = infer_id_offset(snap_path)
-        box_z0_plot = positions_for_ids_by_offset(
-            snap_path=snap_path,
-            ids=box_ids,
-            offset=off_z0,
-            center=center,
-            box_size=box_sim,
-        )
-    except Exception as exc:
-        print(f"Falling back to ParticleID scan for z=0 snapshot mapping: {exc}")
-        box_z0_plot = positions_for_ids_by_scan(
-            snap_path=snap_path,
-            ids=box_ids,
-            center=center,
-            box_size=box_sim,
-        )
-
-    halo_rel = halo_masses = None
-    failed_rel = failed_m = None
-    if fof_path:
-        halo_rel, halo_masses = fof_haloes_relative(fof_path, center=center)
-    if failed_halo_centres is not None and failed_halo_masses is not None and failed_halo_centres.size:
-        # Use the same box size as the z=0 snapshot for relative positioning.
-        failed_rel = unwrap_relative(np.asarray(failed_halo_centres, dtype=np.float64), center, box_sim)
-        failed_m = np.asarray(failed_halo_masses, dtype=np.float64)
-
-    plot_selection(
-        out_png=plot_path,
-        sel_ic=sel_ic_plot,
-        box_ic=box_ic_plot,
-        env_ic=env_ic_plot,
-        sel_z0=sel_z0_plot,
-        box_z0=box_z0_plot,
-        env_z0=env_z0_plot,
-        halo_ic=halo_ic,
-        mins_raw=mins_raw,
-        maxs_raw=maxs_raw,
-        mins=mins,
-        maxs=maxs,
-        slab_half=slab_half,
-        env_half=env_half,
-        kernel_radius=kernel_radius,
-        kernel_boundary_L=kernel_boundary_L,
-        halo_rel=halo_rel,
-        halo_masses=halo_masses,
-        halo_failed_rel=failed_rel,
-        halo_failed_masses=failed_m,
-        halo_mmin=halo_mmin,
-    )
-
-
 def main():
-    ap = argparse.ArgumentParser(description="Generate MUSIC2 zoom config for Tessera from a kernel selection.")
-    ap.add_argument("--grid", type=Path, required=True, help="Gridder output HDF5 (positions + overdensities).")
+    ap = argparse.ArgumentParser(description="Generate MUSIC2 zoom config for Tessera.")
+    ap.add_argument(
+        "--select-mode",
+        choices=("kernel", "halo"),
+        default="kernel",
+        help="Selection mode: overdensity kernel centre (kernel) or random FOF halo (halo).",
+    )
+    ap.add_argument("--label", type=str, help="Optional label stored in zoom_selection.json (useful for suite runs).")
+    ap.add_argument("--grid", type=Path, help="Gridder output HDF5 (positions + overdensities). Required for kernel mode.")
     ap.add_argument("--snap", type=Path, required=True, help="z=0 snapshot with ParticleIDs (pmwd or SWIFT).")
     ap.add_argument("--ic-snap", type=Path, required=True, help="Parent IC snapshot with ParticleIDs and Masses.")
+    ap.add_argument(
+        "--machine",
+        choices=("cosma7", "cosma8"),
+        default=os.environ.get("MACHINE", "cosma7"),
+        help="Select machine for copying the appropriate submit script into the run directory.",
+    )
     ap.add_argument("--kernel-index", type=int, default=0, help="Kernel index (0-based).")
     ap.add_argument("--kernel-radius", type=float, help="Kernel radius (Mpc) override.")
     ap.add_argument(
@@ -571,6 +168,11 @@ def main():
     )
     ap.add_argument("--target-rank", type=int, default=0, help="Nth closest match to target overdensity (0=closest).")
     ap.add_argument("--max-tries", type=int, default=25, help="Max rank increments to try when rejecting regions.")
+    ap.add_argument(
+        "--selection-radius",
+        type=float,
+        help="Selection sphere radius (Mpc). Required for halo mode; ignored for kernel mode unless --kernel-radius is used.",
+    )
 
     ap.add_argument(
         "--out-base",
@@ -597,11 +199,19 @@ def main():
         type=Path,
         help=(
             "Output MUSIC2 zoom config path. If relative, it is interpreted inside the run directory. "
-            "Default: <out-base>/<idx>/music2_zoom_<idx>.conf; also copies to music2_zoom.conf."
+            "Default: <out-base>/<idx>/music2_zoom.conf."
         ),
     )
-    ap.add_argument("--levelmin", type=int, help="Zoom levelmin (defaults to parent levelmin).")
-    ap.add_argument("--levelmax", type=int, required=True, help="Zoom levelmax (finest resolution).")
+    ap.add_argument(
+        "--levelmin",
+        type=int,
+        help="Zoom levelmin (default: setup.levelmin from --template; fallback: parent levelmin).",
+    )
+    ap.add_argument(
+        "--levelmax",
+        type=int,
+        help="Zoom levelmax (finest resolution; default: setup.levelmax from --template).",
+    )
     ap.add_argument(
         "--out-ics",
         type=Path,
@@ -618,40 +228,110 @@ def main():
             "Default: <out-base>/<idx>/zoom_ICs_<idx>.png."
         ),
     )
-    ap.add_argument("--fof", type=Path, help="Optional SWIFT-style FOF catalogue (to overlay halo centres).")
-    ap.add_argument("--halo-mmin", type=float, default=1e4, help="Minimum halo mass to plot (1e10 Msun).")
-    ap.add_argument("--halo-boundary", type=float, default=2.5, help="Boundary buffer L (Mpc).")
+    ap.add_argument(
+        "--fof",
+        type=Path,
+        help="SWIFT-style FOF catalogue (required for halo mode; optional for kernel mode plotting/checks).",
+    )
+    ap.add_argument("--halo-mmin", type=float, default=1e4, help="Minimum halo mass (1e10 Msun).")
+    ap.add_argument("--halo-mmax", type=float, help="Maximum halo mass (1e10 Msun).")
+    ap.add_argument("--halo-seed", type=int, default=0, help="RNG seed for random halo choice in halo mode.")
+    ap.add_argument(
+        "--halo-rank",
+        type=int,
+        help="Select the Nth most massive halo within the mass bounds (0=most massive). If set, overrides --halo-seed.",
+    )
+    ap.add_argument(
+        "--halo-boundary",
+        type=float,
+        default=2.5,
+        help="Boundary buffer L (Mpc) for optional 'boundary halo' rejection check (kernel mode by default).",
+    )
+    ap.add_argument(
+        "--check-boundary-haloes",
+        action="store_true",
+        help="Also run the boundary-halo rejection check in halo mode.",
+    )
+    ap.add_argument(
+        "--target-nhigh",
+        type=float,
+        help="Target estimated high-res particle count in the padded IC-space bbox (geometric estimate).",
+    )
+    ap.add_argument("--target-nhigh-rtol", type=float, default=0.10, help="Relative tolerance for --target-nhigh.")
+    ap.add_argument("--pad-mpc", type=float, default=2.0, help="IC-space bbox padding (Mpc) when not tuning.")
+    ap.add_argument("--pad-min-mpc", type=float, default=0.0, help="Minimum padding (Mpc) during tuning.")
+    ap.add_argument("--pad-max-mpc", type=float, default=20.0, help="Maximum padding (Mpc) during tuning.")
+    ap.add_argument("--pad-tune-iters", type=int, default=30, help="Max iterations for pad tuning (binary search).")
+    ap.add_argument("--allow-overlap", action="store_true", help="Allow overlap with previously created selection spheres.")
+    ap.add_argument("--overlap-buffer-mpc", type=float, default=0.0, help="Extra buffer added when rejecting overlaps (Mpc).")
     ap.add_argument(
         "--swift-template",
         type=Path,
         default=ROOT / "configs" / "swift_zoom_params.yaml",
         help="SWIFT zoom YAML template to copy into the zoom directory.",
     )
+    ap.add_argument(
+        "--metadata",
+        type=Path,
+        default=None,
+        help="Selection metadata JSON filename (basename only; default: zoom_selection.json).",
+    )
     args = ap.parse_args()
+
+    def _resolve_existing_path(p: Path | None) -> Path | None:
+        if p is None:
+            return None
+        p = Path(p)
+        if p.is_absolute():
+            return p
+        if p.exists():
+            return p
+        alt = (ROOT / p)
+        if alt.exists():
+            return alt
+        return p
+
+    # Allow running from any working directory while passing repo-relative paths like `configs/...`.
+    args.parent_config = _resolve_existing_path(args.parent_config)
+    args.template = _resolve_existing_path(args.template)
+    args.swift_template = _resolve_existing_path(args.swift_template)
+    args.grid = _resolve_existing_path(args.grid)
+    args.fof = _resolve_existing_path(args.fof)
+    args.snap = _resolve_existing_path(args.snap)
+    args.ic_snap = _resolve_existing_path(args.ic_snap)
 
     zoom_index = int(args.index) if args.index is not None else next_zoom_index(args.out_base)
     run_dir = (args.out_base / f"{zoom_index:04d}")
+    preexisting = run_dir.exists() and any(run_dir.iterdir())
     run_dir.mkdir(parents=True, exist_ok=True)
     run_dir = run_dir.resolve()
     log_path = run_dir / f"generate_zoom_ics_{zoom_index:04d}.txt"
     log_fh = log_path.open("w")
     old_stdout = sys.stdout
     sys.stdout = _Tee(old_stdout, log_fh)
-    print(f"Logging to {log_path}")
+    # print(f"Logging to {log_path}")
+    if preexisting:
+        print(f"WARNING: {run_dir} already existed and was non-empty; outputs may be overwritten.")
     atexit.register(lambda: setattr(sys, "stdout", old_stdout))
     atexit.register(log_fh.close)
 
-    out_config = _resolve_in_run_dir(args.out_config, run_dir) or (run_dir / f"music2_zoom_{zoom_index:04d}.conf")
+    out_config = _resolve_in_run_dir(args.out_config, run_dir) or (run_dir / "music2_zoom.conf")
     plot_out = _resolve_in_run_dir(args.plot_out, run_dir) or (run_dir / f"zoom_ICs_{zoom_index:04d}.png")
 
     # Always place the MUSIC2 IC output inside the run directory (only allow overriding the basename).
     out_ics_name = args.out_ics.name if args.out_ics is not None else f"zoom_ICS_{zoom_index:04d}.hdf5"
     out_ics = run_dir / out_ics_name
+    metadata_name = args.metadata.name if args.metadata is not None else "zoom_selection.json"
+    metadata_path = run_dir / metadata_name
 
     if args.parent_config is None:
+        raise ValueError("--parent-config cannot be None.")
+    if not args.parent_config.exists():
+        raise FileNotFoundError(f"Parent MUSIC2 config not found: {args.parent_config} (pass --parent-config).")
+    if args.template is None or not args.template.exists():
         raise FileNotFoundError(
-            "Could not find default parent MUSIC2 config; pass --parent-config. "
-            f"Tried: {ROOT / 'configs' / 'music2_parent_tessera.conf'} and {ROOT / 'tessera' / 'music2_parent_tessera.conf'}"
+            "Could not find MUSIC2 zoom template config; pass --template. "
+            f"Tried: {args.template!s}"
         )
 
     parent_cfg = configparser.ConfigParser()
@@ -659,54 +339,234 @@ def main():
     with args.parent_config.open() as fh:
         parent_cfg.read_file(fh)
 
+    template_cfg = configparser.ConfigParser()
+    template_cfg.optionxform = str
+    with args.template.open() as fh:
+        template_cfg.read_file(fh)
+
     parent_levelmin = _parse_int(parent_cfg["setup"]["levelmin"])
     parent_box = _parse_float(parent_cfg["setup"]["boxlength"])
     omega_m = _parse_float(parent_cfg["cosmology"]["Omega_m"])
     omega_b = _parse_float(parent_cfg["cosmology"].get("Omega_b", "0.0"))
     h = _parse_float(parent_cfg["cosmology"]["H0"]) / 100.0
-    base_levelmin = args.levelmin if args.levelmin is not None else parent_levelmin
-    base_levelmax = args.levelmax
+
+    template_levelmin = None
+    template_levelmax = None
+    if "setup" in template_cfg:
+        if "levelmin" in template_cfg["setup"]:
+            template_levelmin = _parse_int(template_cfg["setup"]["levelmin"])
+        if "levelmax" in template_cfg["setup"]:
+            template_levelmax = _parse_int(template_cfg["setup"]["levelmax"])
+
+    if args.levelmin is not None:
+        base_levelmin = int(args.levelmin)
+    elif template_levelmin is not None:
+        base_levelmin = int(template_levelmin)
+    else:
+        base_levelmin = int(parent_levelmin)
+        print(f"WARNING: {args.template} missing [setup]/levelmin; defaulting to parent levelmin={parent_levelmin}.")
+
+    if args.levelmax is not None:
+        base_levelmax = int(args.levelmax)
+    elif template_levelmax is not None:
+        base_levelmax = int(template_levelmax)
+    else:
+        raise ValueError(f"{args.template} missing [setup]/levelmax and --levelmax was not provided.")
+
     if base_levelmax < base_levelmin:
         raise ValueError("levelmax cannot be smaller than levelmin")
 
-    pos_grid, overd = load_gridder(args.grid)
-    radius = kernel_radius_from_gridder(args.grid, args.kernel_index, args.kernel_radius)
+    if args.select_mode == "kernel":
+        if args.grid is None:
+            raise ValueError("--grid is required for --select-mode kernel.")
+    elif args.select_mode == "halo":
+        if args.fof is None:
+            raise ValueError("--fof is required for --select-mode halo.")
+        if args.selection_radius is None:
+            raise ValueError("--selection-radius is required for --select-mode halo.")
+    else:
+        raise RuntimeError(f"Unexpected --select-mode={args.select_mode!r}")
 
-    # Choose centres in log10(1+delta) space (or max delta if no target provided).
-    overd_for_choice = {}
-    for k, d in overd.items():
-        if np.any(d <= -1):
-            bad = int(np.sum(d <= -1))
-            raise RuntimeError(
-                f"{args.grid}: kernel {k} has {bad} grid points with overdensity <= -1; cannot use log10(1+delta)."
-            )
-        overd_for_choice[k] = np.log10(1.0 + d)
-    target_for_choice = None if args.target_logdelta is None else float(args.target_logdelta)
+    if args.target_nhigh is not None and float(args.target_nhigh) <= 0:
+        raise ValueError("--target-nhigh must be > 0.")
+    if float(args.target_nhigh_rtol) < 0:
+        raise ValueError("--target-nhigh-rtol must be >= 0.")
+    if float(args.pad_min_mpc) < 0 or float(args.pad_max_mpc) < 0:
+        raise ValueError("--pad-min-mpc/--pad-max-mpc must be >= 0.")
+    if int(args.pad_tune_iters) < 1:
+        raise ValueError("--pad-tune-iters must be >= 1.")
+    if float(args.overlap_buffer_mpc) < 0:
+        raise ValueError("--overlap-buffer-mpc must be >= 0.")
+    if args.halo_rank is not None and int(args.halo_rank) < 0:
+        raise ValueError("--halo-rank must be >= 0.")
 
-    # Iterate candidate centres by rank until halo-boundary check passes.
+    ids_sim, pos_sim, _, box_sim = load_snap(args.snap, include_masses=False)
+    ic_ids, ic_pos, ic_masses, box_ic = load_snap(args.ic_snap, include_masses=True)
+
+    fof_centres = None
+    fof_masses = None
+    fof_radii = None
+    box_fof = None
+    if args.fof is not None:
+        fof_centres, fof_masses, fof_radii, box_fof = load_fof_catalogue(args.fof)
+        if box_fof is not None and abs(float(box_fof) - float(box_sim)) > 1e-5:
+            print(f"WARNING: FOF BoxSize={float(box_fof):g} differs from snapshot BoxSize={float(box_sim):g} (units mismatch?).")
+
+    existing = []
+    if not args.allow_overlap:
+        for meta in iter_existing_zoom_selections(args.out_base):
+            run_dir_prev = meta.get("_run_dir", None)
+            if isinstance(run_dir_prev, str) and Path(run_dir_prev).resolve() == run_dir:
+                continue
+            cr = selection_center_and_radius(meta)
+            if cr is None:
+                continue
+            cprev, rprev = cr
+            existing.append((cprev, float(rprev), run_dir_prev))
+
+    selection_radius = None
+    overd = None
+    overd_for_choice = None
+    target_for_choice = None
+    candidate_halo_indices = None
+    chosen_halo_index = None
+    chosen_halo_rank = None
+    chosen_halo_mass = None
+
+    if args.select_mode == "kernel":
+        pos_grid, overd = load_gridder(args.grid)
+        selection_radius = kernel_radius_from_gridder(args.grid, args.kernel_index, args.kernel_radius)
+
+        overd_for_choice = {}
+        for k, d in overd.items():
+            if np.any(d <= -1):
+                bad = int(np.sum(d <= -1))
+                raise RuntimeError(
+                    f"{args.grid}: kernel {k} has {bad} grid points with overdensity <= -1; cannot use log10(1+delta)."
+                )
+            overd_for_choice[k] = np.log10(1.0 + d)
+        target_for_choice = None if args.target_logdelta is None else float(args.target_logdelta)
+    else:
+        selection_radius = float(args.selection_radius)
+        masses = np.asarray(fof_masses, dtype=np.float64)
+        mmin = float(args.halo_mmin)
+        mmax = float(args.halo_mmax) if args.halo_mmax is not None else float("inf")
+        eligible = np.where((masses >= mmin) & (masses <= mmax))[0]
+        if eligible.size == 0:
+            raise RuntimeError(f"No haloes found in {args.fof} with {mmin:g} <= M <= {mmax:g} (1e10 Msun).")
+        order = eligible[np.argsort(masses[eligible])[::-1]]  # most massive first
+        if args.halo_rank is not None:
+            if int(args.halo_rank) >= int(order.size):
+                raise RuntimeError(
+                    f"--halo-rank {int(args.halo_rank)} out of range for {order.size} eligible haloes "
+                    f"({mmin:g} <= M <= {mmax:g} in 1e10 Msun)."
+                )
+            candidate_halo_indices = order
+        else:
+            rng = np.random.default_rng(int(args.halo_seed))
+            candidate_halo_indices = rng.permutation(eligible)
+
+    def overlaps_previous(center: np.ndarray, rad: float) -> tuple[bool, str | None]:
+        if not existing:
+            return False, None
+        for cprev, rprev, run_dir_prev in existing:
+            d = periodic_distance(np.asarray(center, dtype=np.float64), cprev, float(box_sim))
+            if d < float(rad) + float(rprev) + float(args.overlap_buffer_mpc):
+                return True, (None if run_dir_prev is None else str(run_dir_prev))
+        return False, None
+
+    def nhigh_estimate_for_bbox(mins_raw: np.ndarray, maxs_raw: np.ndarray, pad: float) -> float:
+        ext = (np.asarray(maxs_raw, dtype=np.float64) - np.asarray(mins_raw, dtype=np.float64)) + (2.0 * float(pad))
+        volume = float(np.prod(ext))
+        spacing_mpc = (float(parent_box) / (2 ** int(base_levelmax))) / float(h)
+        return volume / (spacing_mpc ** 3)
+
+    def tune_pad(mins_raw: np.ndarray, maxs_raw: np.ndarray) -> float:
+        if args.target_nhigh is None:
+            return float(args.pad_mpc)
+        target = float(args.target_nhigh)
+        lo = float(args.pad_min_mpc)
+        hi = float(args.pad_max_mpc)
+        if lo < 0:
+            lo = 0.0
+        if hi < lo:
+            hi = lo
+        n_lo = nhigh_estimate_for_bbox(mins_raw, maxs_raw, lo)
+        n_hi = nhigh_estimate_for_bbox(mins_raw, maxs_raw, hi)
+        if target <= n_lo:
+            return lo
+        if target >= n_hi:
+            return hi
+        for _ in range(int(args.pad_tune_iters)):
+            mid = 0.5 * (lo + hi)
+            n_mid = nhigh_estimate_for_bbox(mins_raw, maxs_raw, mid)
+            if n_mid < target:
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
+
+    def pad_hits_target(mins_raw: np.ndarray, maxs_raw: np.ndarray, pad: float) -> bool:
+        if args.target_nhigh is None:
+            return True
+        target = float(args.target_nhigh)
+        est = nhigh_estimate_for_bbox(mins_raw, maxs_raw, pad)
+        rtol = float(args.target_nhigh_rtol)
+        return abs(est - target) <= rtol * target
+
+    # Iterate candidate centres until overlap / target-nhigh / optional boundary-halo checks pass.
     chosen = None
     for attempt in range(args.max_tries):
-        rank = args.target_rank + attempt
-        center, val_choice, grid_idx = choose_center(
-            pos_grid, overd_for_choice, args.kernel_index, target_for_choice, rank=rank
-        )
-        val_delta = float(overd[args.kernel_index][grid_idx])
+        if args.select_mode == "kernel":
+            rank = args.target_rank + attempt
+            center, val_choice, grid_idx = choose_center(
+                pos_grid, overd_for_choice, args.kernel_index, target_for_choice, rank=rank
+            )
+            val_delta = float(overd[args.kernel_index][grid_idx])
+        else:
+            start = int(args.halo_rank) if args.halo_rank is not None else 0
+            idx_in_list = start + attempt
+            if idx_in_list >= int(candidate_halo_indices.size):
+                break
+            chosen_halo_rank = idx_in_list if args.halo_rank is not None else None
+            chosen_halo_index = int(candidate_halo_indices[idx_in_list])
+            center = np.asarray(fof_centres[chosen_halo_index], dtype=np.float64)
+            chosen_halo_mass = float(fof_masses[chosen_halo_index])
+            val_choice = None
+            val_delta = None
+            grid_idx = None
+            rank = None
 
-        ids_sim, pos_sim, _, box_sim = load_snap(args.snap, include_masses=False)
-        sel_ids, sel_pos = select_sphere(ids_sim, pos_sim, center, radius, box_sim)
+        ov, ov_dir = overlaps_previous(center, float(selection_radius))
+        if ov:
+            print(
+                f"Rejected candidate center due to overlap with prior selection sphere (dir={ov_dir}). "
+                f"R={float(selection_radius):g} Mpc."
+            )
+            continue
+
+        sel_ids, sel_pos = select_sphere(ids_sim, pos_sim, center, float(selection_radius), box_sim)
         if sel_ids.size == 0:
             continue
 
-        ic_ids, ic_pos, ic_masses, box_ic = load_snap(args.ic_snap, include_masses=True)
         pos_ic_rel, mass_ic_sel = match_into_ic(sel_ids, center, ic_ids, ic_pos, ic_masses, box_ic)
         mins_raw, maxs_raw, volume_raw = bounding_box(pos_ic_rel)
 
         # Fixed comoving padding (Mpc) applied to the IC-space refinement box to reduce the
         # chance that low-res boundary particles contaminate the analysis region.
-        pad_mpc = 2.0
+        pad_mpc = tune_pad(mins_raw, maxs_raw)
         mins = mins_raw - pad_mpc
         maxs = maxs_raw + pad_mpc
         volume = float(np.prod(maxs - mins))
+
+        if not pad_hits_target(mins_raw, maxs_raw, pad_mpc):
+            if args.target_nhigh is not None:
+                est = nhigh_estimate_for_bbox(mins_raw, maxs_raw, pad_mpc)
+                print(
+                    f"Rejected candidate due to target-nhigh miss: est={est:,.3g}, target={float(args.target_nhigh):,.3g}, "
+                    f"rtol={float(args.target_nhigh_rtol):g}."
+                )
+                continue
 
         # Halo boundary check: reject if there is a massive halo close to a bbox face and that
         # halo is not fully contained within the IC-space bounding box (based on particle IDs).
@@ -718,28 +578,28 @@ def main():
         failed_halo_centres: list[np.ndarray] = []
         failed_halo_masses: list[float] = []
         halo_ic_plot: np.ndarray | None = None
-        if args.fof:
-            centres_h, masses_h, radii_h, box_fof = load_fof_catalogue(args.fof)
-            masses_h = np.asarray(masses_h, dtype=np.float64)
-            radii_h = np.asarray(radii_h, dtype=np.float64)
+        do_boundary_check = (
+            (args.select_mode == "kernel") or (args.select_mode == "halo" and bool(args.check_boundary_haloes))
+        )
+        if do_boundary_check and args.fof and float(args.halo_boundary) > 0 and fof_centres is not None:
+            masses_h = np.asarray(fof_masses, dtype=np.float64)
+            radii_h = np.asarray(fof_radii, dtype=np.float64)
             keep_h = masses_h >= float(args.halo_mmin)
-            centres_h = centres_h[keep_h]
+            centres_h = np.asarray(fof_centres, dtype=np.float64)[keep_h]
             radii_h = radii_h[keep_h]
             masses_h = masses_h[keep_h]
             L = float(args.halo_boundary)
             if centres_h.size:
-                # Identify haloes near the *kernel sphere boundary* at z=0:
-                # abs(|x_h - center| - R_kernel) <= L
-                rel_h = unwrap_relative(centres_h, center, box_fof)
+                rel_h = unwrap_relative(centres_h, center, float(box_fof))
                 dist = np.linalg.norm(rel_h, axis=1)
-                on_boundary = np.abs(dist - float(radius)) <= L
+                on_boundary = np.abs(dist - float(selection_radius)) <= L
 
                 boundary_centres = centres_h[on_boundary]
                 boundary_radii = radii_h[on_boundary]
                 boundary_masses = masses_h[on_boundary]
                 if boundary_centres.shape[0]:
                     print(
-                        f"Checking {boundary_centres.shape[0]} haloes near kernel boundary "
+                        f"Checking {boundary_centres.shape[0]} haloes near selection boundary "
                         f"(m>={args.halo_mmin:g}, |r-R|<={L:g} Mpc)..."
                     )
 
@@ -780,19 +640,12 @@ def main():
                                     box_ic=box_ic,
                                     zoom_center=center,
                                     max_samples=80_000,
-                                    rng_seed=grid_idx,
-                                )
-                            if bad_halo_count <= 3:
-                                relc = unwrap_relative(np.asarray(hcen, dtype=np.float64)[None, :], center, box_sim)[0]
-                                d = float(np.linalg.norm(relc))
-                                print(
-                                    f"  Failed halo: M={hm:.3g}, Rfof={float(hr):.3g} Mpc, "
-                                    f"|r-center|={d:.3g} Mpc, |(|r|-Rkernel)|={abs(d-float(radius)):.3g} Mpc"
+                                    rng_seed=(0 if grid_idx is None else int(grid_idx)),
                                 )
 
         if bad_halo_count:
             print(
-                f"Rejected center rank={rank} (grid index={grid_idx}) due to {bad_halo_count} massive haloes "
+                f"Rejected center due to {bad_halo_count} massive haloes "
                 "near the kernel boundary that are not fully contained within the IC bounding box."
             )
             # Always write reject plots into the per-zoom output directory (unless the user
@@ -814,7 +667,7 @@ def main():
                     snap_path=args.snap,
                     fof_path=args.fof,
                     halo_mmin=float(args.halo_mmin),
-                    kernel_radius=float(radius),
+                    kernel_radius=float(selection_radius),
                     kernel_boundary_L=float(args.halo_boundary),
                     failed_halo_centres=np.array(failed_halo_centres, dtype=np.float64) if failed_halo_centres else None,
                     failed_halo_masses=np.array(failed_halo_masses, dtype=np.float64) if failed_halo_masses else None,
@@ -828,6 +681,8 @@ def main():
             val_choice,
             val_delta,
             grid_idx,
+            rank,
+            attempt,
             sel_ids,
             sel_pos,
             pos_ic_rel,
@@ -841,6 +696,7 @@ def main():
             box_sim,
             box_ic,
             ic_masses,
+            float(pad_mpc),
         )
         break
 
@@ -852,6 +708,8 @@ def main():
         val_choice,
         val_delta,
         grid_idx,
+        chosen_rank,
+        chosen_attempt,
         sel_ids,
         sel_pos,
         pos_ic_rel,
@@ -865,10 +723,19 @@ def main():
         box_sim,
         box_ic,
         ic_masses,
+        pad_mpc,
     ) = chosen
     print(
-        f"Selected {sel_ids.size} particles within r={radius} Mpc "
-        f"(log10(1+delta)={val_choice:.3g}, delta={val_delta:.3g}, grid index={grid_idx})."
+        f"Selected {sel_ids.size} particles within r={float(selection_radius)} Mpc "
+        + (
+            f"(log10(1+delta)={val_choice:.3g}, delta={val_delta:.3g}, grid index={grid_idx})."
+            if args.select_mode == "kernel"
+            else (
+                f"(halo rank={chosen_halo_rank}, index={chosen_halo_index}, M={chosen_halo_mass:.3g} in 1e10 Msun)."
+                if chosen_halo_rank is not None
+                else f"(halo index={chosen_halo_index}, M={chosen_halo_mass:.3g} in 1e10 Msun)."
+            )
+        )
     )
     total_mass = float(mass_ic_sel.sum())
     mean_density_raw = total_mass / volume_raw
@@ -898,7 +765,7 @@ def main():
     )
     n_high_in_box = mass_box / m_high
 
-    print("\nIC-space bounding box (relative to kernel center, Mpc):")
+    print("\nIC-space bounding box (relative to selection center, Mpc):")
     print(f"  mins (raw): {mins_raw}")
     print(f"  maxs (raw): {maxs_raw}")
     print(f"  extents (raw): {maxs_raw - mins_raw}")
@@ -908,17 +775,26 @@ def main():
     print(f"  maxs (padded): {maxs}")
     print(f"  extents (padded): {maxs - mins}")
     print(f"  volume (padded): {volume:.6e} Mpc^3")
-    print("\nMass summary (from IC particle masses):")
-    print(f"  Total mass in selection: {total_mass:.6e} (10^10 Msun)")
-    print(f"  Mean density in raw box: {mean_density_raw:.6e} (10^10 Msun) / Mpc^3")
-    print(f"  Mean density in padded:  {mean_density:.6e} (10^10 Msun) / Mpc^3")
+    # print("\nMass summary (from IC particle masses):")
+    # print(f"  Total mass in selection: {total_mass:.6e} (10^10 Msun)")
+    # print(f"  Mean density in raw box: {mean_density_raw:.6e} (10^10 Msun) / Mpc^3")
+    # print(f"  Mean density in padded:  {mean_density:.6e} (10^10 Msun) / Mpc^3")
     print("\nZoom mass / resolution estimate:")
     print(f"  Parent levelmin: {parent_levelmin} (m_parent={m_parent:.6e} in 10^10 Msun)")
     print(f"  Zoom levelmax:   {base_levelmax} (Δlevels={refine_levels}, m_high={m_high:.6e} in 10^10 Msun)")
     print(f"  High-res particles to represent selected mass: ~{n_high_for_mass:,.0f} ({n_high_for_mass**(1/3):.1f}^3)")
     print(f"  High-res particles in bounding-box volume (if fully filled): ~{n_high_in_box:,.0f} ({n_high_in_box**(1/3):.1f}^3)")
     print(f"  Bounding-box particle count (parent IC): {n_box_particles:,}")
-    print(f"  Bounding-box mass (parent IC): {mass_box:.6e} (10^10 Msun)")
+    # print(f"  Bounding-box mass (parent IC): {mass_box:.6e} (10^10 Msun)")
+    spacing_mpc = (float(parent_box) / (2 ** int(base_levelmax))) / float(h)
+    n_high_geom_raw = float(volume_raw) / (spacing_mpc ** 3)
+    n_high_geom_padded = float(volume) / (spacing_mpc ** 3)
+    print("\nGeometric high-res particle estimate:")
+    print(f"  spacing (Mpc): {spacing_mpc:.6e}")
+    print(f"  N_high (raw bbox):    ~{n_high_geom_raw:,.0f} ({n_high_geom_raw**(1/3):.1f}^3)")
+    print(f"  N_high (padded bbox): ~{n_high_geom_padded:,.0f} ({n_high_geom_padded**(1/3):.1f}^3)")
+    if args.target_nhigh is not None:
+        print(f"  target_nhigh: {float(args.target_nhigh):,.3g} (rtol={float(args.target_nhigh_rtol):g})")
     # Coordinates coming from SWIFT-format HDF5 snapshots are in Mpc (Header.BoxSize units),
     # while MUSIC2 config `boxlength` is in Mpc/h. Use the parent IC Header.BoxSize for
     # periodic wrapping and compute dimensionless fractions accordingly in `write_music_zoom_config`.
@@ -926,6 +802,115 @@ def main():
     abs_max = (center + maxs) % box_ic
     extent_abs = (abs_max - abs_min) % box_ic
     center_abs = (abs_min + 0.5 * extent_abs) % box_ic
+
+    selection = {
+        "mode": str(args.select_mode),
+        "selection_radius_mpc": float(selection_radius),
+        "center_mpc": np.asarray(center, dtype=np.float64),
+    }
+    if args.select_mode == "kernel":
+        selection.update(
+            {
+                "kernel_index": int(args.kernel_index),
+                "kernel_radius_mpc": float(selection_radius),
+                "kernel_radius_override_mpc": (None if args.kernel_radius is None else float(args.kernel_radius)),
+                "target_logdelta": (None if args.target_logdelta is None else float(args.target_logdelta)),
+                "target_rank": int(args.target_rank),
+                "chosen_rank": int(chosen_rank),
+                "chosen_attempt": int(chosen_attempt),
+                "grid_index": int(grid_idx),
+                "log10_1p_delta": float(val_choice),
+                "delta": float(val_delta),
+            }
+        )
+    else:
+        selection.update(
+            {
+                "halo_index": (None if chosen_halo_index is None else int(chosen_halo_index)),
+                "halo_mass_1e10msun": (None if chosen_halo_mass is None else float(chosen_halo_mass)),
+                "halo_seed": int(args.halo_seed),
+                "halo_rank": (None if args.halo_rank is None else int(args.halo_rank)),
+                "halo_rank_chosen": (None if chosen_halo_rank is None else int(chosen_halo_rank)),
+                "halo_mmin_1e10msun": float(args.halo_mmin),
+                "halo_mmax_1e10msun": (None if args.halo_mmax is None else float(args.halo_mmax)),
+                "chosen_attempt": int(chosen_attempt),
+            }
+        )
+    bbox = {
+        "pad_mpc": float(pad_mpc),
+        "mins_raw_mpc": np.asarray(mins_raw, dtype=np.float64),
+        "maxs_raw_mpc": np.asarray(maxs_raw, dtype=np.float64),
+        "mins_padded_mpc": np.asarray(mins, dtype=np.float64),
+        "maxs_padded_mpc": np.asarray(maxs, dtype=np.float64),
+        "volume_raw_mpc3": float(volume_raw),
+        "volume_padded_mpc3": float(volume),
+        "center_abs_mpc": np.asarray(center_abs, dtype=np.float64),
+        "extent_abs_mpc": np.asarray(extent_abs, dtype=np.float64),
+        "box_ic_mpc": float(box_ic),
+        "box_sim_mpc": float(box_sim),
+    }
+    levels = {
+        "parent_levelmin": int(parent_levelmin),
+        "zoom_levelmin": int(base_levelmin),
+        "zoom_levelmax": int(base_levelmax),
+    }
+    cosmology = {
+        "Omega_m": float(omega_m),
+        "Omega_b": float(omega_b),
+        "h": float(h),
+        "boxlength_mpc_h": float(parent_box),
+    }
+    mass_summary = {
+        "total_mass_selection_1e10msun": float(total_mass),
+        "mean_density_raw_1e10msun_mpc3": float(mean_density_raw),
+        "mean_density_padded_1e10msun_mpc3": float(mean_density),
+        "parent_particle_mass_1e10msun_h": float(m_parent),
+        "highres_particle_mass_1e10msun_h": float(m_high),
+        "n_high_for_selection_mass": float(n_high_for_mass),
+        "bbox_parent_particle_count": int(n_box_particles),
+        "bbox_parent_mass_1e10msun_h": float(mass_box),
+        "n_high_in_bbox_if_filled": float(n_high_in_box),
+        "n_high_geom_raw_bbox": float(n_high_geom_raw),
+        "n_high_geom_padded_bbox": float(n_high_geom_padded),
+    }
+    payload = {
+        "schema": "tessera.zoom_selection.v2",
+        "created_utc": utc_now_iso(),
+        "label": (None if args.label is None else str(args.label)),
+        "zoom_index": int(zoom_index),
+        "run_dir": run_dir,
+        "inputs": {
+            "gridder": args.grid,
+            "snap_z0": args.snap,
+            "ic_snap": args.ic_snap,
+            "fof": args.fof,
+            "parent_config": args.parent_config,
+            "music_template": args.template,
+            "swift_template": args.swift_template,
+        },
+        "outputs": {
+            "metadata": metadata_path,
+            "log": log_path,
+            "music2_zoom_conf": out_config,
+            "zoom_ics_hdf5": out_ics,
+            "plot_png": plot_out,
+            "swift_params_yaml": (run_dir / "swift_zoom_params.yaml"),
+        },
+        "selection": selection,
+        "bbox": bbox,
+        "levels": levels,
+        "cosmology": cosmology,
+        "mass_summary": mass_summary,
+        "counts": {
+            "n_selected_particles": int(sel_ids.size),
+        },
+        "command": {
+            "argv": list(sys.argv),
+            "cwd": str(Path.cwd()),
+        },
+    }
+    write_zoom_selection_metadata(metadata_path, payload)
+    # print(f"Wrote selection metadata to {metadata_path}")
 
     write_music_zoom_config(
         template_path=args.template,
@@ -939,20 +924,7 @@ def main():
         base_levelmax=base_levelmax,
         out_ics=out_ics,
     )
-    print(f"\nWrote MUSIC2 zoom config to {out_config}")
-
-    # Keep a stable filename for downstream scripts (e.g. submit scripts) while also producing
-    # an index-stamped config for bookkeeping.
-    stable_music2_cfg = run_dir / "music2_zoom.conf"
-    try:
-        if out_config.resolve() != stable_music2_cfg.resolve():
-            shutil.copy2(out_config, stable_music2_cfg)
-            print(f"Copied MUSIC2 zoom config to {stable_music2_cfg}")
-    except FileNotFoundError:
-        # If the user points --out-config somewhere non-existent, resolve() can fail.
-        if out_config != stable_music2_cfg:
-            shutil.copy2(out_config, stable_music2_cfg)
-            print(f"Copied MUSIC2 zoom config to {stable_music2_cfg}")
+    # print(f"\nWrote MUSIC2 zoom config to {out_config}")
 
     # Copy/write SWIFT zoom YAML into the run directory, updating cosmology and paths.
     swift_out = run_dir / "swift_zoom_params.yaml"
@@ -967,28 +939,30 @@ def main():
         boxlength_mpc_h=parent_box,
         levelmax=base_levelmax,
     )
-    print(f"Wrote SWIFT zoom params to {swift_out}")
+    # print(f"Wrote SWIFT zoom params to {swift_out}")
 
     # Copy the SWIFT zoom submission script into the run directory for convenience.
-    if DEFAULT_SUBMIT_SCRIPT is None:
-        print("WARNING: no SWIFT submit script found in repo; not copying to run directory.")
+    submit_script = DEFAULT_SUBMIT_SCRIPT_COSMA7 if args.machine == "cosma7" else DEFAULT_SUBMIT_SCRIPT_COSMA8
+    if not submit_script.exists():
+        print(f"WARNING: submit script not found at {submit_script} for machine={args.machine}; not copying to run directory.")
     else:
-        shutil.copy2(DEFAULT_SUBMIT_SCRIPT, run_dir / DEFAULT_SUBMIT_SCRIPT.name)
-        print(f"Copied SWIFT submit script to {run_dir / DEFAULT_SUBMIT_SCRIPT.name}")
+        dest = run_dir / "submit_zoom.slurm"
+        shutil.copy2(submit_script, dest)
+        # print(f"Copied submit script to {dest} (source: {submit_script})")
 
     # Copy MUSIC2 helper script for convenience.
-    if DEFAULT_MUSIC2_HELPER is None:
-        print("WARNING: no MUSIC2 helper script found in repo; not copying to run directory.")
+    if not DEFAULT_MUSIC2_HELPER.exists():
+        print(f"WARNING: MUSIC2 helper script not found at {DEFAULT_MUSIC2_HELPER}; not copying to run directory.")
     else:
         shutil.copy2(DEFAULT_MUSIC2_HELPER, run_dir / DEFAULT_MUSIC2_HELPER.name)
-        print(f"Copied MUSIC2 helper script to {run_dir / DEFAULT_MUSIC2_HELPER.name}")
+        # print(f"Copied MUSIC2 helper script to {run_dir / DEFAULT_MUSIC2_HELPER.name}")
 
     # Copy SWIFT output list to the run directory if present (template refers to output_times.txt).
-    if DEFAULT_OUTPUT_TIMES is None:
-        print("WARNING: output_times.txt not found in repo; SWIFT may fail if template uses output_list.")
+    if not DEFAULT_OUTPUT_TIMES.exists():
+        print(f"WARNING: output times not found at {DEFAULT_OUTPUT_TIMES}; SWIFT may fail if template uses output_list.")
     else:
         shutil.copy2(DEFAULT_OUTPUT_TIMES, run_dir / DEFAULT_OUTPUT_TIMES.name)
-        print(f"Copied output times to {run_dir / DEFAULT_OUTPUT_TIMES.name}")
+        # print(f"Copied output times to {run_dir / DEFAULT_OUTPUT_TIMES.name}")
 
     if plot_out:
         make_debug_plot(
@@ -1006,10 +980,10 @@ def main():
             snap_path=args.snap,
             fof_path=args.fof,
             halo_mmin=float(args.halo_mmin),
-            kernel_radius=float(radius),
+            kernel_radius=float(selection_radius),
             kernel_boundary_L=float(args.halo_boundary),
             halo_ic=None,
         )
-        print(f"Wrote selection plot to {plot_out}")
+        # print(f"Wrote selection plot to {plot_out}")
 if __name__ == "__main__":
     main()

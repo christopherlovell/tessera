@@ -37,6 +37,8 @@ Snapshots:
   output_list:         output_times.txt
   compression:         4
   invoke_ps:           1
+  select_output_on: 1
+  select_output: /cosma8/data/dp004/dc-love2/codes/tessera/configs/select_output.yml
 
 # Parameters governing the conserved quantities statistics
 Statistics:
@@ -54,35 +56,24 @@ InitialConditions:
   cleanup_h_factors:           0    
   cleanup_velocity_factors:    0  
 
-# Structure finding options
-StructureFinding:
-  disabled:             1
-
-# Power spectrum calculation options
-PowerSpectrum:
-  grid_side_length: 128
-  num_folds: 4
-  fold_factor: 2
-  window_order: 2
-  requested_spectra: ["matter-matter"]
-
-# Parameters governing the CSDS snapshot system
-CSDS:
-  delta_step:           10       # Update the particle log every this many updates
-  basename:             csds_index  # Common part of the filenames
-  initial_buffer_size:  0.3      # (Optional) Buffer size in GB
-  buffer_scale:	        2       # (Optional) When buffer size is too small, update it with required memory times buffer_scale
-
-
 # Parameters defining a zoom region (only used for running zoom simulations with --zoom runtime flag)
 ZoomRegion:
-  region_pad_factor:          1.1    # How much larger the zoom region will be than the high res particle distribution in the ICs?
-  zoom_top_level_depth:       2     # The depth of the zoom top level cells in a single background cell.
-  bkg_top_level_cells:        16     # How many cells should the background be resolved with? (This is treated as gospel)
-  buffer_cell_depth:          0      # (Optional, only used when buffer cells are needed) The depth of the top level buffer cells in a single background cell. (default: 0)
-  neighbour_max_tree_depth:   2      # (Optional) The depth of the cell trees neighbouring the zoom region (default: -1)
-  bkg_subdepth_diff_grav:     3      # The minimum difference between the leaf depth and the task depth for background cells.
-  max_com_dx:                 0.1    # (Optional) The maximum allowed displacement of the centre of mass of the zoom region from the centre of the box in units of the zoom region extent. When this is exceeded, we rebuild the zoom region.
+  region_pad_factor: 1.01
+  zoom_top_level_depth: 4
+  bkg_top_level_cells: 33
+  buffer_cell_depth: 0
+  neighbour_max_tree_depth: 4
+  bkg_subdepth_diff_grav: 3
+  max_com_dx: 0.1
+
+# ZoomRegion:
+#   region_pad_factor:          1.1    # How much larger the zoom region will be than the high res particle distribution in the ICs?
+#   zoom_top_level_depth:       2     # The depth of the zoom top level cells in a single background cell.
+#   bkg_top_level_cells:        16     # How many cells should the background be resolved with? (This is treated as gospel)
+#   buffer_cell_depth:          0      # (Optional, only used when buffer cells are needed) The depth of the top level buffer cells in a single background cell. (default: 0)
+#   neighbour_max_tree_depth:   2      # (Optional) The depth of the cell trees neighbouring the zoom region (default: -1)
+#   bkg_subdepth_diff_grav:     3      # The minimum difference between the leaf depth and the task depth for background cells.
+#   max_com_dx:                 0.1    # (Optional) The maximum allowed displacement of the centre of mass of the zoom region from the centre of the box in units of the zoom region extent. When this is exceeded, we rebuild the zoom region.
 
 FOF:
   basename:             fof
@@ -91,3 +82,8 @@ FOF:
   linking_types:                   [0, 1, 0, 0, 0, 0, 0]  # Which particle types to consider for linking    (here only DM)
   attaching_types:                 [1, 0, 0, 0, 1, 1, 0]  # Which particle types to consider for attaching  (here gas, stars, and BHs)
   seed_black_holes_enabled:        0           # Do not seed black holes when running FOF
+
+DomainDecomposition:
+  initial_type: grid
+  repartition_type: none
+  trigger: 0.25

@@ -1,0 +1,7 @@
+Default:
+  # Particle Type DM
+  Coordinates_DM: DScale5
+  Velocities_DM: DScale1
+  Masses_DM: off
+  ParticleIDs_DM: Nbit40
+  Softenings_DM: off

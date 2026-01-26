@@ -1,0 +1,172 @@
+# Demo suite specification for `scripts/generate_zoom_suite.py`.
+#
+# Replace all /path/to/... placeholders with your real paths.
+#
+# Notes:
+# - Kernel mode stratification is done in log10(1+delta) space via `target_logdelta`.
+# - Halo mode stratification is done by mass bins via `halo_mmin`/`halo_mmax`, with `halo_seed`
+#   controlling the random halo draw within each bin.
+
+out_base: /snap8/scratch/dp004/dc-love2/tessera
+
+common:
+  machine: cosma8
+  snap: /cosma7/data/dp004/dc-love2/data/tessera/parent/snap_0011.hdf5
+  grid: /cosma7/data/dp004/dc-love2/data/tessera/parent/gridder/gridder_output_512.hdf5
+  ic_snap: /cosma7/data/dp004/dc-love2/data/tessera/parent/music2_ICs_parent.hdf5
+  fof: /cosma7/data/dp004/dc-love2/data/tessera/parent/fof_0011.hdf5
+  parent_config: configs/music2_parent_tessera.conf
+  template: configs/music2_zoom.conf
+  swift_template: configs/swift_zoom_params.yaml
+  levelmin: 6
+  levelmax: 15
+  pad_mpc: 1.0
+
+  # Optional: tune padding to target an estimated high-res particle count in the padded IC bbox.
+  # target_nhigh: 1.0e8
+  # target_nhigh_rtol: 0.10
+  # pad_min_mpc: 0.0
+  # pad_max_mpc: 20.0
+  # pad_tune_iters: 30
+
+  # Optional: require non-overlap of the z=0 selection spheres (default behavior).
+  # overlap_buffer_mpc: 0.0
+
+regions:
+  # Median + underdense regions (stratified in log10(1+delta)).
+  - label: tessera_0000
+    select_mode: kernel
+    kernel_index: 0
+    target_logdelta: -1.23
+    target_rank: 0
+    target_nhigh: 134217728
+
+  - label: tessera_0001
+    select_mode: kernel
+    kernel_index: 0
+    target_logdelta: -1.2
+    target_rank: 0
+    target_nhigh: 134217728
+
+  - label: tessera_0002
+    select_mode: kernel
+    kernel_index: 0
+    target_logdelta: -1.1
+    target_rank: 0
+    target_nhigh: 134217728
+
+  - label: tessera_0003
+    select_mode: kernel
+    kernel_index: 0
+    target_logdelta: -1.0
+    target_rank: 0
+    target_nhigh: 134217728
+
+  - label: tessera_0004
+    select_mode: kernel
+    kernel_index: 0
+    target_logdelta: -0.9
+    target_rank: 0
+    target_nhigh: 134217728
+
+  - label: tessera_0005
+    select_mode: kernel
+    kernel_index: 0
+    target_logdelta: -0.8
+    target_rank: 0
+    target_nhigh: 134217728
+
+  - label: tessera_0006
+    select_mode: kernel
+    kernel_index: 0
+    target_logdelta: -0.7
+    target_rank: 0
+    target_nhigh: 134217728
+
+  - label: tessera_0007
+    select_mode: kernel
+    kernel_index: 0
+    target_logdelta: -0.6
+    target_rank: 0
+    target_nhigh: 134217728
+
+  - label: tessera_0008
+    select_mode: kernel
+    kernel_index: 0
+    target_logdelta: -0.5
+    target_rank: 0
+    target_nhigh: 134217728
+
+  - label: tessera_0009
+    select_mode: kernel
+    kernel_index: 0
+    target_logdelta: -0.4
+    target_rank: 0
+    target_nhigh: 134217728
+
+  - label: tessera_0010
+    select_mode: kernel
+    kernel_index: 0
+    target_logdelta: -0.3
+    target_rank: 0
+    target_nhigh: 134217728
+
+  - label: tessera_0011
+    select_mode: kernel
+    kernel_index: 0
+    target_logdelta: -0.2
+    target_rank: 0
+    target_nhigh: 134217728
+
+  - label: tessera_0012
+    select_mode: kernel
+    kernel_index: 0
+    target_logdelta: -0.1
+    target_rank: 0
+    target_nhigh: 134217728
+
+  - label: tessera_0013
+    select_mode: kernel
+    kernel_index: 0
+    target_logdelta: 0.0
+    target_rank: 0
+    target_nhigh: 134217728
+
+  # # Five massive haloes (stratified in mass space, 1e4–4e5 in 1e10 Msun).
+  # - label: halo_m1e4_2e4
+  #   select_mode: halo
+  #   halo_mmin: 1.0e4
+  #   halo_mmax: 2.0e4
+  #   halo_seed: 1001
+  #   selection_radius: 10.0
+
+  # - label: halo_m2e4_4e4
+  #   select_mode: halo
+  #   halo_mmin: 2.0e4
+  #   halo_mmax: 4.0e4
+  #   halo_seed: 1002
+  #   selection_radius: 10.0
+
+  # - label: halo_m4e4_8e4
+  #   select_mode: halo
+  #   halo_mmin: 4.0e4
+  #   halo_mmax: 8.0e4
+  #   halo_seed: 1003
+  #   selection_radius: 10.0
+
+  # - label: halo_m8e4_16e4
+  #   select_mode: halo
+  #   halo_mmin: 8.0e4
+  #   halo_mmax: 1.6e5
+  #   halo_seed: 1004
+  #   selection_radius: 10.0
+
+  # - label: halo_m16e4_40e4
+  #   select_mode: halo
+  #   halo_mmin: 1.6e5
+  #   halo_mmax: 1.0e6
+  #   # halo_seed: 1005
+  #   halo_rank: 0
+  #   selection_radius: 10.0
+
+

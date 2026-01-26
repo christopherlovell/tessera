@@ -7,33 +7,22 @@ the main script focused on orchestration/CLI logic.
 """
 
 import configparser
+import json
 import random
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+import matplotlib.pyplot as plt
 import yaml
 
 
-def _ensure_pmwd_utilities_on_path() -> None:
-    pmwd_scripts = Path("/cosma7/data/dp004/dc-love2/codes/pmwd_zoom_selection/scripts")
-    if not pmwd_scripts.exists():
-        root = Path(__file__).resolve().parent.parent
-        pmwd_scripts = (root.parent / "pmwd_zoom_selection" / "scripts").resolve()
-    if pmwd_scripts.exists() and str(pmwd_scripts) not in sys.path:
-        sys.path.insert(0, str(pmwd_scripts))
-
-
-_ensure_pmwd_utilities_on_path()
-
-try:
-    from utilities import unwrap_relative  # noqa: E402
-except ModuleNotFoundError as exc:  # pragma: no cover
-    raise ModuleNotFoundError(
-        "Could not import `utilities` from pmwd_zoom_selection; expected it at "
-        "`/cosma7/data/dp004/dc-love2/codes/pmwd_zoom_selection/scripts/utilities.py`."
-    ) from exc
-
+def unwrap_relative(pos, center, box):
+    """Center positions on center with periodic wrap to [-box/2, box/2]."""
+    delta = pos - center
+    delta = (delta + box / 2) % box - box / 2
+    return delta
 
 class _Tee:
     def __init__(self, *streams):
@@ -66,6 +55,526 @@ def next_zoom_index(base: Path) -> int:
         if p.is_dir() and p.name.isdigit() and len(p.name) == 4:
             idxs.append(int(p.name))
     return (max(idxs) + 1) if idxs else 0
+
+
+def _json_default(obj):
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.integer, np.floating, np.bool_)):
+        return obj.item()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def write_zoom_selection_metadata(path: Path, payload: dict) -> None:
+    """
+    Write a small, structured metadata file describing a zoom selection/run.
+
+    The file is written atomically (write temp + replace).
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    text = json.dumps(payload, indent=2, sort_keys=True, default=_json_default) + "\n"
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
+def read_zoom_selection_metadata(path: Path) -> dict:
+    path = Path(path)
+    return json.loads(path.read_text())
+
+
+def selection_center_and_radius(meta: dict) -> tuple[np.ndarray, float] | None:
+    sel = meta.get("selection", {})
+    if not isinstance(sel, dict):
+        return None
+    center = sel.get("center_mpc", None)
+    if center is None:
+        return None
+    radius = sel.get("selection_radius_mpc", sel.get("kernel_radius_mpc", None))
+    if radius is None:
+        return None
+    return np.asarray(center, dtype=np.float64), float(radius)
+
+
+def iter_existing_zoom_selections(out_base: Path) -> list[dict]:
+    out_base = Path(out_base)
+    if not out_base.exists():
+        return []
+    metas: list[dict] = []
+    for p in sorted(out_base.iterdir()):
+        if not (p.is_dir() and p.name.isdigit() and len(p.name) == 4):
+            continue
+        meta_path = p / "zoom_selection.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = read_zoom_selection_metadata(meta_path)
+        except Exception:
+            continue
+        if not isinstance(meta, dict):
+            continue
+        meta["_meta_path"] = str(meta_path)
+        meta["_run_dir"] = str(p)
+        metas.append(meta)
+    return metas
+
+
+def periodic_distance(a: np.ndarray, b: np.ndarray, box: float) -> float:
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    delta = unwrap_relative(b[None, :], a, float(box))[0]
+    return float(np.linalg.norm(delta))
+
+
+def existing_labels(out_base: Path) -> set[str]:
+    labels: set[str] = set()
+    for meta in iter_existing_zoom_selections(out_base):
+        lab = meta.get("label", None)
+        if isinstance(lab, str) and lab:
+            labels.add(lab)
+    return labels
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def plot_selection(
+    out_png: Path,
+    sel_ic: np.ndarray,
+    box_ic: np.ndarray,
+    env_ic: np.ndarray,
+    sel_z0: np.ndarray,
+    box_z0: np.ndarray,
+    env_z0: np.ndarray,
+    halo_ic: np.ndarray | None,
+    mins_raw: np.ndarray | None,
+    maxs_raw: np.ndarray | None,
+    mins: np.ndarray,
+    maxs: np.ndarray,
+    slab_half: float,
+    env_half: float,
+    kernel_radius: float | None = None,
+    kernel_boundary_L: float | None = None,
+    halo_rel: np.ndarray | None = None,
+    halo_masses: np.ndarray | None = None,
+    halo_failed_rel: np.ndarray | None = None,
+    halo_failed_masses: np.ndarray | None = None,
+    halo_mmin: float = 1e14,
+) -> None:
+    fig, axes = plt.subplots(2, 3, figsize=(12, 8), constrained_layout=True)
+    planes = [(0, 1, "x", "y"), (0, 2, "x", "z"), (1, 2, "y", "z")]
+    slab_axes = [2, 1, 0]  # depth axis for XY, XZ, YZ
+    plot_fov = 75.0  # Mpc, fallback if no points plotted
+
+    # Use a single, global marker-size scaling so halo marker sizes are consistent across
+    # all projections (and between the two rows when applicable).
+    halo_logm_lo: float | None = None
+    halo_logm_hi: float | None = None
+    logm_ref_parts: list[np.ndarray] = []
+    if halo_rel is not None and halo_masses is not None:
+        hm0 = np.asarray(halo_masses, dtype=np.float64)
+        hr0 = np.asarray(halo_rel, dtype=np.float64)
+        env0 = np.all(np.abs(hr0) <= float(env_half), axis=1)
+        m0 = env0 & (hm0 >= float(halo_mmin))
+        if np.any(m0):
+            logm_ref_parts.append(np.log10(np.maximum(hm0[m0], 1.0)))
+    if halo_failed_masses is not None and halo_failed_rel is not None:
+        fh0 = np.asarray(halo_failed_masses, dtype=np.float64)
+        fr0 = np.asarray(halo_failed_rel, dtype=np.float64)
+        envf = np.all(np.abs(fr0) <= float(env_half), axis=1)
+        mf = envf & (fh0 >= float(halo_mmin))
+        if np.any(mf):
+            logm_ref_parts.append(np.log10(np.maximum(fh0[mf], 1.0)))
+    if logm_ref_parts:
+        logm_ref = np.concatenate(logm_ref_parts, axis=0)
+        if logm_ref.size:
+            lo, hi = np.percentile(logm_ref, [5, 99.5]) if logm_ref.size > 5 else (logm_ref.min(), logm_ref.max())
+            halo_logm_lo = float(lo)
+            halo_logm_hi = float(hi if hi > lo else lo + 1e-6)
+
+    def draw_bbox(ax, i, j):
+        rect = np.array(
+            [
+                [mins[i], mins[j]],
+                [maxs[i], mins[j]],
+                [maxs[i], maxs[j]],
+                [mins[i], maxs[j]],
+                [mins[i], mins[j]],
+            ]
+        )
+        ax.plot(rect[:, 0], rect[:, 1], color="tab:red", lw=1)
+        if mins_raw is not None and maxs_raw is not None:
+            rect_raw = np.array(
+                [
+                    [mins_raw[i], mins_raw[j]],
+                    [maxs_raw[i], mins_raw[j]],
+                    [maxs_raw[i], maxs_raw[j]],
+                    [mins_raw[i], maxs_raw[j]],
+                    [mins_raw[i], mins_raw[j]],
+                ]
+            )
+            ax.plot(rect_raw[:, 0], rect_raw[:, 1], color="k", lw=0.8, ls="--", alpha=0.8)
+
+    def set_limits_from_points(ax, pts2d: np.ndarray, *, pad_frac: float = 0.03, min_pad: float = 1.0) -> None:
+        if pts2d.size == 0:
+            ax.set_xlim(-plot_fov, plot_fov)
+            ax.set_ylim(-plot_fov, plot_fov)
+            return
+        xs = pts2d[:, 0]
+        ys = pts2d[:, 1]
+        xmin = float(np.min(xs))
+        xmax = float(np.max(xs))
+        ymin = float(np.min(ys))
+        ymax = float(np.max(ys))
+        rx = xmax - xmin
+        ry = ymax - ymin
+        pad = max(min_pad, pad_frac * max(rx, ry, 1e-12))
+        ax.set_xlim(xmin - pad, xmax + pad)
+        ax.set_ylim(ymin - pad, ymax + pad)
+
+    def draw_row(
+        row_axes,
+        title,
+        sel_pts,
+        box_pts,
+        env_pts,
+        *,
+        halo_ic_pts: np.ndarray | None,
+        draw_box: bool,
+        draw_haloes: bool = True,
+        focus_half: float | None = None,
+    ):
+        for proj, (ax, (i, j, xi, yi)) in enumerate(zip(row_axes, planes)):
+            k = slab_axes[proj]
+            env_mask = np.abs(env_pts[:, k]) <= slab_half
+            env_xy = env_pts[env_mask][:, [i, j]]
+            box_xy = box_pts[:, [i, j]]
+            sel_xy = sel_pts[:, [i, j]]
+            ax.scatter(env_xy[:, 0], env_xy[:, 1], s=0.3, alpha=0.1, color="gray", rasterized=True)
+            ax.scatter(box_xy[:, 0], box_xy[:, 1], s=0.5, alpha=0.15, color="tab:blue", rasterized=True)
+            ax.scatter(sel_xy[:, 0], sel_xy[:, 1], s=2.0, alpha=0.35, color="tab:orange", rasterized=True)
+
+            lim_pts = [env_xy, box_xy, sel_xy]
+            if halo_ic_pts is not None and halo_ic_pts.size:
+                halo_ic_xy = halo_ic_pts[:, [i, j]]
+                ax.scatter(
+                    halo_ic_xy[:, 0],
+                    halo_ic_xy[:, 1],
+                    s=0.8,
+                    alpha=0.5,
+                    color="tab:green",
+                    rasterized=True,
+                )
+                lim_pts.append(halo_ic_xy)
+            if draw_haloes and halo_rel is not None and halo_masses is not None:
+                hm = np.asarray(halo_masses, dtype=np.float64)
+                hr = np.asarray(halo_rel, dtype=np.float64)
+                mcut = hm >= halo_mmin
+                if np.any(mcut):
+                    env_cut = np.all(np.abs(hr) <= env_half, axis=1)
+                    hslab = mcut & env_cut & (np.abs(hr[:, k]) <= slab_half)
+                    if np.any(hslab):
+                        hr_xy = hr[hslab][:, [i, j]]
+                        logm = np.log10(hm[hslab])
+                        if halo_logm_lo is None or halo_logm_hi is None:
+                            lo, hi = np.percentile(logm, [5, 99.5]) if logm.size > 5 else (logm.min(), logm.max())
+                            lo = float(lo)
+                            hi = float(hi if hi > lo else lo + 1e-6)
+                        else:
+                            lo = float(halo_logm_lo)
+                            hi = float(halo_logm_hi)
+                        sizes = 10.0 + 150.0 * (np.clip(logm, lo, hi) - lo) / (hi - lo)
+                        ax.scatter(
+                            hr_xy[:, 0],
+                            hr_xy[:, 1],
+                            s=sizes,
+                            alpha=0.35,
+                            color="tab:purple",
+                            rasterized=True,
+                        )
+                        lim_pts.append(hr_xy)
+            if draw_haloes and halo_failed_rel is not None and halo_failed_masses is not None:
+                fh = np.asarray(halo_failed_masses, dtype=np.float64)
+                fr = np.asarray(halo_failed_rel, dtype=np.float64)
+                if fr.size:
+                    env_cut = np.all(np.abs(fr) <= env_half, axis=1)
+                    fr = fr[env_cut]
+                    fh = fh[env_cut]
+                if fr.size:
+                    fr_xy = fr[:, [i, j]]
+                    flogm = np.log10(np.maximum(fh, 1.0))
+                    if halo_logm_lo is None or halo_logm_hi is None:
+                        flo, fhi = np.percentile(flogm, [5, 99.5]) if flogm.size > 5 else (flogm.min(), flogm.max())
+                        flo = float(flo)
+                        fhi = float(fhi if fhi > flo else flo + 1e-6)
+                    else:
+                        flo = float(halo_logm_lo)
+                        fhi = float(halo_logm_hi)
+                    fsizes = 30.0 + 220.0 * (np.clip(flogm, flo, fhi) - flo) / (fhi - flo)
+                    ax.scatter(
+                        fr_xy[:, 0],
+                        fr_xy[:, 1],
+                        s=fsizes,
+                        alpha=0.9,
+                        color="tab:green",
+                        marker="x",
+                        linewidths=1.2,
+                        rasterized=True,
+                    )
+                    lim_pts.append(fr_xy)
+            if draw_haloes and kernel_radius is not None:
+                import matplotlib.patches as mpatches
+
+                circ = mpatches.Circle((0.0, 0.0), float(kernel_radius), fill=False, lw=1.0, ls="--", color="k", alpha=0.7)
+                ax.add_patch(circ)
+                if kernel_boundary_L is not None and float(kernel_boundary_L) > 0:
+                    r_in = max(0.0, float(kernel_radius) - float(kernel_boundary_L))
+                    r_out = float(kernel_radius) + float(kernel_boundary_L)
+                    ax.add_patch(mpatches.Circle((0.0, 0.0), r_in, fill=False, lw=0.8, ls=":", color="k", alpha=0.5))
+                    ax.add_patch(mpatches.Circle((0.0, 0.0), r_out, fill=False, lw=0.8, ls=":", color="k", alpha=0.5))
+                    lim_pts.append(np.array([[-r_out, -r_out], [r_out, r_out]], dtype=np.float64))
+            if draw_box:
+                draw_bbox(ax, i, j)
+                lim_pts.append(np.array([[mins[i], mins[j]], [maxs[i], maxs[j]]], dtype=np.float64))
+                if mins_raw is not None and maxs_raw is not None:
+                    lim_pts.append(np.array([[mins_raw[i], mins_raw[j]], [maxs_raw[i], maxs_raw[j]]], dtype=np.float64))
+
+            if focus_half is not None:
+                fh = float(focus_half)
+                ax.set_xlim(-fh, fh)
+                ax.set_ylim(-fh, fh)
+            else:
+                set_limits_from_points(ax, np.vstack([p for p in lim_pts if p.size]))
+            ax.set_xlabel(f"{xi} - center")
+            ax.set_ylabel(f"{yi} - center")
+            ax.set_aspect("equal")
+        row_axes[0].set_title(title)
+
+    draw_row(
+        axes[0, :],
+        "ICs (bbox in red, environment slab in gray)",
+        sel_ic,
+        box_ic,
+        env_ic,
+        halo_ic_pts=halo_ic,
+        draw_box=True,
+        draw_haloes=False,
+    )
+    draw_row(
+        axes[1, :],
+        "z=0 (selection sphere dashed, environment slab in gray)",
+        sel_z0,
+        box_z0,
+        env_z0,
+        halo_ic_pts=None,
+        draw_box=False,
+        focus_half=(
+            None
+            if kernel_radius is None
+            else 3 * (float(kernel_radius) + (0.0 if kernel_boundary_L is None else float(kernel_boundary_L)))
+        ),
+    )
+
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=200)
+    plt.close(fig)
+
+
+def halo_ic_positions_for_plot(
+    *,
+    ids_sim: np.ndarray,
+    pos_sim: np.ndarray,
+    box_sim: float,
+    halo_center: np.ndarray,
+    halo_radius: float,
+    ic_pos: np.ndarray,
+    ic_id_offset: int,
+    box_ic: float,
+    zoom_center: np.ndarray,
+    max_samples: int = 50_000,
+    rng_seed: int = 0,
+) -> np.ndarray:
+    """
+    Sample IC-relative positions of particles within a halo radius at z=0 (for plotting).
+
+    Uses reservoir sampling over halo particles; avoids allocating full-size temporaries.
+    """
+    radius2 = float(halo_radius) ** 2
+    half = 0.5 * float(box_sim)
+    rng = np.random.default_rng(rng_seed)
+
+    n = int(pos_sim.shape[0])
+    chunk = 2_000_000
+    samples: list[np.ndarray] = []
+    seen = 0
+
+    for start in range(0, n, chunk):
+        stop = min(start + chunk, n)
+        pos = pos_sim[start:stop]
+        ids = ids_sim[start:stop].astype(np.int64, copy=False)
+
+        delta = pos - halo_center
+        delta = (delta + half) % float(box_sim) - half
+        dist2 = np.einsum("ij,ij->i", delta, delta)
+        in_halo = dist2 <= radius2
+        if not np.any(in_halo):
+            continue
+
+        halo_ids = ids[in_halo]
+        idx = halo_ids - int(ic_id_offset)
+        ok = (idx >= 0) & (idx < ic_pos.shape[0])
+        if not np.any(ok):
+            continue
+        idx = idx[ok]
+
+        ic_halo_pos = ic_pos[idx]
+        ic_rel = unwrap_relative(ic_halo_pos, zoom_center, box_ic)
+
+        for p in ic_rel:
+            seen += 1
+            if len(samples) < max_samples:
+                samples.append(p)
+            else:
+                j = int(rng.integers(0, seen))
+                if j < max_samples:
+                    samples[j] = p
+
+    return np.array(samples, dtype=np.float64)
+
+
+def make_debug_plot(
+    plot_path: Path,
+    *,
+    center: np.ndarray,
+    box_sim: float,
+    box_ic: float,
+    mins_raw: np.ndarray | None,
+    maxs_raw: np.ndarray | None,
+    mins: np.ndarray,
+    maxs: np.ndarray,
+    sel_pos: np.ndarray,
+    pos_ic_rel: np.ndarray,
+    ic_path: Path,
+    snap_path: Path,
+    fof_path: Path | None,
+    halo_mmin: float,
+    kernel_radius: float | None = None,
+    kernel_boundary_L: float | None = None,
+    failed_halo_centres: np.ndarray | None = None,
+    failed_halo_masses: np.ndarray | None = None,
+    halo_ic: np.ndarray | None = None,
+) -> None:
+    rng = np.random.default_rng(0)
+    max_sel_plot = 50000
+    max_box_plot = 200000
+    max_env_plot = 300000
+
+    sel_ic_plot = pos_ic_rel
+    sel_z0_plot = unwrap_relative(sel_pos, center, box_sim)
+    if sel_ic_plot.shape[0] > max_sel_plot:
+        keep = rng.choice(sel_ic_plot.shape[0], size=max_sel_plot, replace=False)
+        sel_ic_plot = sel_ic_plot[keep]
+        sel_z0_plot = sel_z0_plot[keep]
+
+    box_ids, box_ic_plot, _box_ic_size, _n_box, _m_box = sample_box_particles(
+        ic_path=ic_path,
+        center=center,
+        mins=mins,
+        maxs=maxs,
+        max_samples=max_box_plot,
+        seed=0,
+    )
+    if box_ids.size == 0:
+        raise RuntimeError("No particles found inside the IC-space bounding box to plot.")
+
+    extents = maxs - mins
+    zoom_diameter = float(np.max(extents))
+    slab_half = 0.5 * zoom_diameter
+    env_half = 2.0 * zoom_diameter
+
+    def sample_environment(path: Path, box_size: float) -> np.ndarray:
+        import h5py
+
+        env: list[np.ndarray] = []
+        seen = 0
+        chunk = 2_000_000
+        with h5py.File(path, "r") as f:
+            pos_ds = f["PartType1/Coordinates"]
+            n = int(pos_ds.shape[0])
+            for start in range(0, n, chunk):
+                stop = min(start + chunk, n)
+                pos = np.array(pos_ds[start:stop], dtype=np.float64)
+                rel = unwrap_relative(pos, center, box_size)
+                mask = np.all(np.abs(rel) <= env_half, axis=1)
+                if not np.any(mask):
+                    continue
+                rel = rel[mask]
+                for rpos in rel:
+                    seen += 1
+                    if len(env) < max_env_plot:
+                        env.append(rpos)
+                    else:
+                        j = rng.integers(0, seen)
+                        if j < max_env_plot:
+                            env[j] = rpos
+        return np.array(env, dtype=np.float64)
+
+    env_ic_plot = sample_environment(ic_path, box_ic)
+    env_z0_plot = sample_environment(snap_path, box_sim)
+
+    try:
+        off_z0, _ = infer_id_offset(snap_path)
+        box_z0_plot = positions_for_ids_by_offset(
+            snap_path=snap_path,
+            ids=box_ids,
+            offset=off_z0,
+            center=center,
+            box_size=box_sim,
+        )
+    except Exception as exc:
+        print(f"Falling back to ParticleID scan for z=0 snapshot mapping: {exc}")
+        box_z0_plot = positions_for_ids_by_scan(
+            snap_path=snap_path,
+            ids=box_ids,
+            center=center,
+            box_size=box_sim,
+        )
+
+    halo_rel = halo_masses = None
+    failed_rel = failed_m = None
+    if fof_path:
+        halo_rel, halo_masses = fof_haloes_relative(fof_path, center=center)
+    if failed_halo_centres is not None and failed_halo_masses is not None and failed_halo_centres.size:
+        failed_rel = unwrap_relative(np.asarray(failed_halo_centres, dtype=np.float64), center, box_sim)
+        failed_m = np.asarray(failed_halo_masses, dtype=np.float64)
+
+    plot_selection(
+        out_png=plot_path,
+        sel_ic=sel_ic_plot,
+        box_ic=box_ic_plot,
+        env_ic=env_ic_plot,
+        sel_z0=sel_z0_plot,
+        box_z0=box_z0_plot,
+        env_z0=env_z0_plot,
+        halo_ic=halo_ic,
+        mins_raw=mins_raw,
+        maxs_raw=maxs_raw,
+        mins=mins,
+        maxs=maxs,
+        slab_half=slab_half,
+        env_half=env_half,
+        kernel_radius=kernel_radius,
+        kernel_boundary_L=kernel_boundary_L,
+        halo_rel=halo_rel,
+        halo_masses=halo_masses,
+        halo_failed_rel=failed_rel,
+        halo_failed_masses=failed_m,
+        halo_mmin=halo_mmin,
+    )
 
 
 def write_swift_zoom_yaml(
