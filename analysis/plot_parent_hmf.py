@@ -5,11 +5,21 @@ This script reads FOF catalogue files from the parent simulation and plots
 the halo mass function (dn/dlog10M) for all available snapshots.
 """
 
-import numpy as np
-import matplotlib.pyplot as plt
-import h5py
 from pathlib import Path
 import glob
+
+import h5py
+import matplotlib as mpl
+import numpy as np
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import BoundaryNorm, ListedColormap
+
+# Apply local matplotlib defaults for analysis plots.
+_MPLRC = Path(__file__).resolve().parent / "matplotlibrc.txt"
+if _MPLRC.exists():
+    mpl.rc_file(str(_MPLRC))
+
+import matplotlib.pyplot as plt
 from matplotlib.cm import viridis
 
 
@@ -130,10 +140,13 @@ def plot_mass_functions(data_dir, output_file='halo_mass_function.png'):
     print(f"Found {len(fof_files)} FOF files")
     
     # Set up the figure
-    fig, ax = plt.subplots(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=(6, 6), constrained_layout=True)
     
     # Color map for snapshots
     colors = viridis(np.linspace(0, 1, len(fof_files)))
+
+    plotted_redshifts = []
+    plotted_colors = []
     
     # Determine global mass range for consistent binning
     all_masses = []
@@ -145,11 +158,11 @@ def plot_mass_functions(data_dir, output_file='halo_mass_function.png'):
     if len(all_masses) == 0:
         raise ValueError("No halos found in any FOF file")
     
-    log_mass_min = np.log10(min(all_masses))
+    log_mass_min = 14  # np.log10(min(all_masses))
     log_mass_max = np.log10(max(all_masses))
     
     # Add some padding
-    log_mass_min -= 0.1
+    log_mass_min -= 0.0
     log_mass_max += 0.1
     
     print(f"Mass range: 10^{log_mass_min:.1f} - 10^{log_mass_max:.1f} Msun")
@@ -173,11 +186,13 @@ def plot_mass_functions(data_dir, output_file='halo_mass_function.png'):
         mask = dn_dlogM > 0
         
         print(f"  Snapshot {snap_num}: z={redshift:.2f}, {len(masses)} halos")
+
+        plotted_redshifts.append(float(redshift))
+        plotted_colors.append(colors[i])
         
         ax.plot(
             bin_centers[mask], dn_dlogM[mask],
             color=colors[i], 
-            label=f'z = {redshift:.2f}',
             linewidth=1.5,
             alpha=0.8
         )
@@ -186,33 +201,64 @@ def plot_mass_functions(data_dir, output_file='halo_mass_function.png'):
         if i == len(fof_files) - 1:
             ax.fill_between(
                 bin_centers[mask],
-                (dn_dlogM - poisson_err)[mask],
+                np.max([[1e-9]*np.sum(mask), (dn_dlogM - poisson_err)[mask]], axis=0),
                 (dn_dlogM + poisson_err)[mask],
                 color=colors[i],
                 alpha=0.2
             )
     
     # Formatting
-    ax.set_xlabel(r'$\log_{10}(M_{\rm halo} / M_\odot)$', fontsize=14)
-    ax.set_ylabel(r'$dn/d\log_{10}M$ [Mpc$^{-3}$]', fontsize=14)
-    ax.set_title('FOF Halo Mass Function - Parent Simulation', fontsize=14)
-    
+    ax.set_xlabel(r'${\rm log_{10}} \, M_{\rm halo} \,/\, {\rm M_\odot}$', fontsize=14)
+    ax.set_ylabel(r'$\Phi \,/\, {\rm Mpc^{-3}} \, {\rm dex^{-1}}$', fontsize=14)
     ax.set_yscale('log')
     ax.set_xlim(log_mass_min, log_mass_max)
     
     # Set y-axis limits based on data
-    ax.set_ylim(1e-8, None)
+    ax.set_ylim(1e-9, None)
     
-    ax.legend(loc='upper right', fontsize=10, ncol=2)
+    # Discrete colorbar keyed by snapshot redshift.
+    if plotted_redshifts:
+        line_alpha = 0.8
+        cmap_colors = np.asarray(plotted_colors, dtype=np.float64)
+        if cmap_colors.ndim != 2 or cmap_colors.shape[1] not in (3, 4):
+            raise RuntimeError(f"Unexpected plotted_colors array shape: {cmap_colors.shape}")
+        if cmap_colors.shape[1] == 3:
+            cmap_colors = np.concatenate([cmap_colors, line_alpha * np.ones((cmap_colors.shape[0], 1))], axis=1)
+        else:
+            cmap_colors = cmap_colors.copy()
+            cmap_colors[:, 3] = line_alpha
+        cmap = ListedColormap(cmap_colors)
+
+        bounds = np.arange(len(plotted_colors) + 1, dtype=np.float64)
+        norm = BoundaryNorm(bounds, cmap.N)
+        sm = ScalarMappable(norm=norm, cmap=cmap)
+        sm.set_array([])
+        ticks = np.arange(len(plotted_colors), dtype=np.float64) + 0.5
+        # Place the discrete colorbar in the top-right corner of the axes, using an explicit
+        # axes-fraction placement (more predictable than `borderpad`).
+        cax = ax.inset_axes([0.92, 0.42, 0.035, 0.55])
+        cax.patch.set_facecolor("white")
+        cax.patch.set_alpha(0.75)
+        cax.patch.set_edgecolor("none")
+        cbar = fig.colorbar(sm, cax=cax, boundaries=bounds, ticks=ticks, spacing="proportional", drawedges=True)
+        # Ensure alpha is applied even if the colorbar artist overrides colormap alpha.
+        if getattr(cbar, "solids", None) is not None:
+            cbar.solids.set_alpha(line_alpha)
+        for coll in getattr(cbar.ax, "collections", []):
+            coll.set_alpha(line_alpha)
+        # Put ticks/labels outside the bar.
+        cbar.ax.yaxis.set_ticks_position("left")
+        cbar.ax.yaxis.set_label_position("left")
+        cbar.ax.tick_params(which="major", direction="out", pad=2)
+        cbar.ax.set_yticklabels([f"{z:.2f}" for z in plotted_redshifts], fontsize=11)
+        cbar.ax.set_title("Redshift", pad=2)
     ax.grid(True, alpha=0.3, linestyle='--')
     
     ax.tick_params(axis='both', which='major', labelsize=12)
     
-    plt.tight_layout()
-    
     # Save figure
     output_path = Path(output_file)
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.savefig(output_path, bbox_inches='tight')
     print(f"\nSaved plot to {output_path}")
     
     plt.close()

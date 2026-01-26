@@ -1,0 +1,30 @@
+savefig.dpi : 300
+path.simplify : True
+font.sans-serif : Liberation Sans
+mathtext.fontset : custom
+mathtext.rm : Liberation Sans
+mathtext.it : Liberation Sans
+mathtext.bf : Liberation Sans:bold
+text.usetex : False
+font.size : 9
+axes.linewidth : 1.0
+xtick.major.size : 4
+ytick.major.size : 4
+xtick.minor.size : 2
+ytick.minor.size : 2
+xtick.labelsize : 8
+ytick.labelsize : 8
+ytick.direction : in
+xtick.direction : in
+ytick.minor.visible : True
+xtick.minor.visible : True
+xtick.major.width : 0.8
+ytick.major.width : 0.8
+xtick.minor.width : 0.6
+ytick.minor.width : 0.6
+axes.grid : True
+grid.alpha : 0.05
+grid.color : k
+grid.linestyle : -
+grid.linewidth : 0.5
+legend.frameon : False
