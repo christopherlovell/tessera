@@ -21,7 +21,12 @@ def _add_repo_root_to_path() -> None:
 
 _add_repo_root_to_path()
 
-from tessera.emulator.conditional_hmf import load_emulator, load_gridder_overdensity
+from tessera.emulator.conditional_hmf import (
+    infer_two_smallest_kernel_radii,
+    load_emulator,
+    load_gridder_overdensity,
+    load_gridder_overdensity_pair,
+)
 
 
 def fit_overdensity_edgeworth(delta: np.ndarray, *, clip_min: float = -1.0 + 1e-12) -> dict[str, float | int]:
@@ -239,6 +244,53 @@ def plot_overdensity_distribution(
     plt.close(fig)
 
 
+def plot_overdensity_distribution_2d(
+    delta12: np.ndarray,
+    *,
+    out: Path,
+    nbins: int = 160,
+    clip_min: float = -1.0 + 1e-12,
+    label1: str = r"$\log_{10}(1+\delta_1)$",
+    label2: str = r"$\log_{10}(1+\delta_2)$",
+) -> None:
+    """
+    Plot a 2D histogram of (log10(1+delta1), log10(1+delta2)).
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
+
+    delta12 = np.asarray(delta12, dtype=np.float64)
+    if delta12.ndim != 2 or delta12.shape[1] != 2:
+        raise ValueError("delta12 must have shape (N,2)")
+    m = np.isfinite(delta12[:, 0]) & np.isfinite(delta12[:, 1]) & (delta12[:, 0] > float(clip_min)) & (delta12[:, 1] > float(clip_min))
+    if not np.any(m):
+        raise ValueError("No valid delta samples for 2D plotting.")
+    d1 = np.clip(delta12[m, 0], float(clip_min), None)
+    d2 = np.clip(delta12[m, 1], float(clip_min), None)
+    x1 = np.log10(1.0 + d1)
+    x2 = np.log10(1.0 + d2)
+
+    H, xedges, yedges = np.histogram2d(x1, x2, bins=int(nbins))
+    corr = float(np.corrcoef(x1, x2)[0, 1]) if x1.size >= 2 else float("nan")
+
+    fig, ax = plt.subplots(figsize=(7.2, 6.2), constrained_layout=True)
+    vmax = float(np.max(H)) if H.size else 1.0
+    norm = LogNorm(vmin=1.0, vmax=max(vmax, 1.0))
+    im = ax.pcolormesh(xedges, yedges, H.T, shading="auto", norm=norm, cmap="viridis")
+    cbar = fig.colorbar(im, ax=ax, pad=0.02)
+    cbar.set_label("Count per bin")
+    ax.set_xlabel(label1)
+    ax.set_ylabel(label2)
+    ax.set_title(f"Overdensity 2D histogram (N={int(x1.size):,}, corr={corr:.3f})")
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=200)
+    plt.close(fig)
+
+
 def plot_global_hmf_comparison(
     *,
     log10M: np.ndarray,
@@ -292,25 +344,40 @@ def _predict_log_n_batch(model: dict, delta_eval: np.ndarray) -> np.ndarray:
     dtype = jnp.float64 if bool(jax.config.read("jax_enable_x64")) else jnp.float32
     Phi = jnp.asarray(model["Phi"], dtype=dtype)
     log_n_base = jnp.asarray(model["log_n_base"], dtype=dtype)
-    delta_train = jnp.asarray(model["delta_train"], dtype=dtype)
-    delta_mu = float(model["delta_mu"])
-    delta_sig = float(model["delta_sig"]) + 1e-12
+    delta_mu = np.asarray(model["delta_mu"], dtype=np.float64).reshape(-1)
+    delta_sig = np.asarray(model["delta_sig"], dtype=np.float64).reshape(-1) + 1e-12
+    delta_train = np.asarray(model["delta_train"], dtype=np.float64)
+    delta_eval = np.asarray(delta_eval, dtype=np.float64)
+    if delta_train.ndim == 1:
+        delta_train = delta_train[:, None]
+    if delta_eval.ndim == 1:
+        delta_eval = delta_eval[:, None]
+    if delta_train.shape[1] != delta_eval.shape[1] or int(delta_mu.size) != int(delta_train.shape[1]):
+        raise ValueError("delta dimension mismatch between model and delta_eval")
 
     amp = jnp.exp(jnp.asarray(model["log_amp"], dtype=dtype))
     ell = jnp.exp(jnp.asarray(model["log_ell"], dtype=dtype))
     jit = jnp.exp(jnp.asarray(model["log_jitter"], dtype=dtype))
     Z = jnp.asarray(model["Z"], dtype=dtype)
 
-    delta_t = (delta_train - delta_mu) / delta_sig
-    delta_eval_t = (jnp.asarray(delta_eval, dtype=dtype) - delta_mu) / delta_sig
+    delta_t = (jnp.asarray(delta_train, dtype=dtype) - jnp.asarray(delta_mu, dtype=dtype)[None, :]) / jnp.asarray(
+        delta_sig, dtype=dtype
+    )[None, :]
+    delta_eval_t = (jnp.asarray(delta_eval, dtype=dtype) - jnp.asarray(delta_mu, dtype=dtype)[None, :]) / jnp.asarray(
+        delta_sig, dtype=dtype
+    )[None, :]
 
     mus = []
     for k in range(Phi.shape[0]):
         Kk = _rbf_kernel(jnp, delta_t, amp[k], ell[k], jit[k])
         Lk = jnp.linalg.cholesky(Kk)
         v = jsp.linalg.solve_triangular(Lk.T, Z[k], lower=False)
-        d = delta_t[:, None] - delta_eval_t[None, :]
-        k_star = (amp[k] ** 2) * jnp.exp(-0.5 * (d**2) / (ell[k] ** 2))
+        ellk = ell[k]
+        if ellk.ndim == 0:
+            ellk = jnp.full((delta_t.shape[1],), ellk, dtype=delta_t.dtype)
+        diff = (delta_t[:, None, :] - delta_eval_t[None, :, :]) / ellk[None, None, :]
+        sq = jnp.sum(diff * diff, axis=-1)
+        k_star = (amp[k] ** 2) * jnp.exp(-0.5 * sq)
         mus.append(k_star.T @ v)
     mus = jnp.stack(mus, axis=0)  # (K, S_eval)
 
@@ -332,6 +399,9 @@ def integrate_global_hmf_mc(
     Monte-Carlo estimate of:
         n_global(M) = E_{p(delta)}[ n(M|delta) ].
     """
+    dmu = np.asarray(model.get("delta_mu", np.asarray([0.0])), dtype=np.float64).reshape(-1)
+    if dmu.size != 1:
+        raise ValueError("Edgeworth integration is only implemented for 1D overdensity models.")
     y = _sample_y_normal(mu=float(mu), sigma=float(sigma), n=int(n_mc), seed=int(seed))
     z = (y - float(mu)) / float(sigma)
     w = _edgeworth_correction(z, skew=float(skew), kurt_excess=float(kurt_excess))
@@ -365,9 +435,14 @@ def integrate_global_hmf_empirical(
 
     using the delta samples directly (e.g. from the full gridder field).
     """
-    delta_samples = np.asarray(delta_samples, dtype=np.float64).ravel()
-    delta_samples = delta_samples[np.isfinite(delta_samples)]
-    if delta_samples.size == 0:
+    delta_samples = np.asarray(delta_samples, dtype=np.float64)
+    if delta_samples.ndim == 1:
+        delta_samples = delta_samples.reshape(-1, 1)
+    if delta_samples.ndim != 2:
+        raise ValueError("delta_samples must have shape (N,) or (N,D)")
+    m = np.all(np.isfinite(delta_samples), axis=1)
+    delta_samples = delta_samples[m]
+    if delta_samples.shape[0] == 0:
         raise ValueError("No finite delta samples provided for empirical integration.")
 
     batch_size = int(batch_size)
@@ -378,7 +453,7 @@ def integrate_global_hmf_empirical(
     centers = 0.5 * (edges[:-1] + edges[1:])
 
     acc = None
-    n_total = int(delta_samples.size)
+    n_total = int(delta_samples.shape[0])
     for start in range(0, n_total, batch_size):
         d = delta_samples[start : start + batch_size]
         log_n = _predict_log_n_batch(model, d)  # (B, J)
@@ -519,35 +594,62 @@ def main() -> None:
 
     if args.cmd == "integrate":
         model = load_emulator(args.model)
-        kernel_radius = args.kernel_radius
-        if kernel_radius is None and "kernel_radius" in model:
-            kernel_radius = float(model["kernel_radius"])
-        if kernel_radius is None:
-            raise ValueError("Kernel radius not available. Provide --kernel-radius or use a model that stores it.")
-
+        # sphere radius is not needed for the integral; keep as optional metadata.
         gridder_file = args.gridder_file
         if gridder_file is None and "gridder_file" in model:
             gridder_file = Path(str(model["gridder_file"]))
         if gridder_file is None:
             raise ValueError("Gridder file not provided. Pass --gridder-file or retrain to save it into the model.")
 
-        _pos, grid_delta = load_gridder_overdensity(gridder_file, kernel_radius=float(kernel_radius))
+        # Determine the overdensity kernel radii to use for sampling p(delta).
+        kr1 = None
+        kr2 = None
+        if "kernel_radii" in model:
+            rr = np.asarray(model["kernel_radii"], dtype=np.float64).reshape(-1)
+            if rr.size >= 2:
+                kr1, kr2 = float(rr[0]), float(rr[1])
+        if kr1 is None or kr2 is None:
+            kr1, kr2 = infer_two_smallest_kernel_radii(gridder_file)
+        if float(kr2) < float(kr1):
+            kr1, kr2 = kr2, kr1
+        print(f"kernel_radii {float(kr1):g} {float(kr2):g}")
+
+        _pos, grid_delta1, grid_delta2 = load_gridder_overdensity_pair(
+            gridder_file, kernel_radius_1=float(kr1), kernel_radius_2=float(kr2)
+        )
         outdir = Path(__file__).resolve().parent.parent / "plots"
 
-        delta_used = np.asarray(grid_delta, dtype=np.float64)
-        if int(args.delta_subsample) > 0 and delta_used.size > int(args.delta_subsample):
+        delta_used = np.stack([np.asarray(grid_delta1, dtype=np.float64), np.asarray(grid_delta2, dtype=np.float64)], axis=1)
+        if int(args.delta_subsample) > 0 and delta_used.shape[0] > int(args.delta_subsample):
             rng = np.random.default_rng(int(args.seed) + 12345)
-            delta_used = rng.choice(delta_used, size=int(args.delta_subsample), replace=False)
+            pick = rng.choice(np.arange(int(delta_used.shape[0]), dtype=np.int64), size=int(args.delta_subsample), replace=False)
+            delta_used = delta_used[pick]
 
         plot_path = args.delta_fit_plot if args.delta_fit_plot is not None else (outdir / f"global_hmf_overdensity_fit_{Path(args.model).stem}.png")
+        dmu = np.asarray(model.get("delta_mu", np.asarray([0.0])), dtype=np.float64).reshape(-1)
         if args.delta_method == "empirical":
-            plot_overdensity_distribution(delta_used, out=Path(plot_path), nbins=int(args.delta_fit_nbins))
+            if dmu.size == 1:
+                delta_1d = np.asarray(delta_used[:, 1], dtype=np.float64).reshape(-1, 1)
+                plot_overdensity_distribution(delta_1d[:, 0], out=Path(plot_path), nbins=int(args.delta_fit_nbins))
+            else:
+                plot_overdensity_distribution_2d(
+                    delta_used,
+                    out=Path(plot_path),
+                    nbins=int(args.delta_fit_nbins),
+                    label1=rf"$\log_{{10}}(1+\delta_{{R={float(kr1):g}}})$",
+                    label2=rf"$\log_{{10}}(1+\delta_{{R={float(kr2):g}}})$",
+                )
             print(f"Saved {plot_path}")
-            log10M, n_global = integrate_global_hmf_empirical(model, delta_samples=delta_used, batch_size=int(args.batch_size))
+            log10M, n_global = integrate_global_hmf_empirical(
+                model, delta_samples=(delta_1d if dmu.size == 1 else delta_used), batch_size=int(args.batch_size)
+            )
         elif args.delta_method == "edgeworth":
-            fit = fit_overdensity_edgeworth(delta_used)
+            if dmu.size != 1:
+                raise ValueError("Edgeworth delta-method is only implemented for 1D overdensity models.")
+            delta_1d = np.asarray(delta_used[:, 1], dtype=np.float64).reshape(-1)
+            fit = fit_overdensity_edgeworth(delta_1d)
             plot_overdensity_distribution_with_fit(
-                delta_used,
+                delta_1d,
                 mu=float(fit["mu"]),
                 sigma=float(fit["sigma"]),
                 skew=float(fit["skew"]),

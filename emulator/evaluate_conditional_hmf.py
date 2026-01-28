@@ -22,9 +22,13 @@ _add_repo_root_to_path()
 
 from tessera.emulator.conditional_hmf import (
     _choose_centers_stratified,
+    _choose_centers_stratified_2d,
+    _choose_centers_stratified_2d_excluding,
     _rbf_kernel,
+    infer_two_smallest_kernel_radii,
     load_emulator,
     load_gridder_overdensity,
+    load_gridder_overdensity_pair,
     read_swift_fof,
 )
 
@@ -55,6 +59,13 @@ def _choose_centers_stratified_excluding(delta: np.ndarray, n: int, seed: int, e
 
     sub = _choose_centers_stratified(delta[avail_idx], n, seed)
     return avail_idx[np.asarray(sub, dtype=np.int64)]
+
+
+def _as_2d(arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(arr, dtype=np.float64)
+    if arr.ndim == 1:
+        return arr[:, None]
+    return arr
 
 def _infer_unique_kernel_radius_from_gridder(path: Path) -> float | None:
     """
@@ -94,25 +105,36 @@ def predict_log_n_batch(model: dict, delta_eval: np.ndarray) -> np.ndarray:
     dtype = jnp.float64 if bool(jax.config.read("jax_enable_x64")) else jnp.float32
     Phi = jnp.asarray(model["Phi"], dtype=dtype)
     log_n_base = jnp.asarray(model["log_n_base"], dtype=dtype)
-    delta_train = jnp.asarray(model["delta_train"], dtype=dtype)
-    delta_mu = float(model["delta_mu"])
-    delta_sig = float(model["delta_sig"]) + 1e-12
+    delta_mu = np.asarray(model["delta_mu"], dtype=np.float64).reshape(-1)
+    delta_sig = np.asarray(model["delta_sig"], dtype=np.float64).reshape(-1) + 1e-12
+    delta_train = _as_2d(np.asarray(model["delta_train"], dtype=np.float64))
+    delta_eval = _as_2d(np.asarray(delta_eval, dtype=np.float64))
+    if delta_train.shape[1] != delta_eval.shape[1] or int(delta_mu.size) != int(delta_train.shape[1]):
+        raise ValueError("delta dimension mismatch between model and delta_eval")
 
     amp = jnp.exp(jnp.asarray(model["log_amp"], dtype=dtype))
     ell = jnp.exp(jnp.asarray(model["log_ell"], dtype=dtype))
     jit = jnp.exp(jnp.asarray(model["log_jitter"], dtype=dtype))
     Z = jnp.asarray(model["Z"], dtype=dtype)
 
-    delta_t = (delta_train - delta_mu) / delta_sig
-    delta_eval_t = (jnp.asarray(delta_eval, dtype=dtype) - delta_mu) / delta_sig
+    delta_t = (jnp.asarray(delta_train, dtype=dtype) - jnp.asarray(delta_mu, dtype=dtype)[None, :]) / jnp.asarray(
+        delta_sig, dtype=dtype
+    )[None, :]
+    delta_eval_t = (jnp.asarray(delta_eval, dtype=dtype) - jnp.asarray(delta_mu, dtype=dtype)[None, :]) / jnp.asarray(
+        delta_sig, dtype=dtype
+    )[None, :]
 
     mus = []
     for k in range(Phi.shape[0]):
         Kk = _rbf_kernel(jnp, delta_t, amp[k], ell[k], jit[k])
         Lk = jnp.linalg.cholesky(Kk)
         v = jsp.linalg.solve_triangular(Lk.T, Z[k], lower=False)
-        d = delta_t[:, None] - delta_eval_t[None, :]
-        k_star = (amp[k] ** 2) * jnp.exp(-0.5 * (d**2) / (ell[k] ** 2))
+        ellk = ell[k]
+        if ellk.ndim == 0:
+            ellk = jnp.full((delta_t.shape[1],), ellk, dtype=delta_t.dtype)
+        diff = (delta_t[:, None, :] - delta_eval_t[None, :, :]) / ellk[None, None, :]
+        sq = jnp.sum(diff * diff, axis=-1)
+        k_star = (amp[k] ** 2) * jnp.exp(-0.5 * sq)
         mus.append(k_star.T @ v)
     mus = jnp.stack(mus, axis=0)  # (K,S_eval)
 
@@ -132,17 +154,24 @@ def predict_log_n_batch_with_var(model: dict, delta_eval: np.ndarray) -> tuple[n
     Phi = jnp.asarray(model["Phi"], dtype=dtype)
     Phi2 = Phi * Phi
     log_n_base = jnp.asarray(model["log_n_base"], dtype=dtype)
-    delta_train = jnp.asarray(model["delta_train"], dtype=dtype)
-    delta_mu = float(model["delta_mu"])
-    delta_sig = float(model["delta_sig"]) + 1e-12
+    delta_mu = np.asarray(model["delta_mu"], dtype=np.float64).reshape(-1)
+    delta_sig = np.asarray(model["delta_sig"], dtype=np.float64).reshape(-1) + 1e-12
+    delta_train = _as_2d(np.asarray(model["delta_train"], dtype=np.float64))
+    delta_eval = _as_2d(np.asarray(delta_eval, dtype=np.float64))
+    if delta_train.shape[1] != delta_eval.shape[1] or int(delta_mu.size) != int(delta_train.shape[1]):
+        raise ValueError("delta dimension mismatch between model and delta_eval")
 
     amp = jnp.exp(jnp.asarray(model["log_amp"], dtype=dtype))
     ell = jnp.exp(jnp.asarray(model["log_ell"], dtype=dtype))
     jit = jnp.exp(jnp.asarray(model["log_jitter"], dtype=dtype))
     Z = jnp.asarray(model["Z"], dtype=dtype)
 
-    delta_t = (delta_train - delta_mu) / delta_sig
-    delta_eval_t = (jnp.asarray(delta_eval, dtype=dtype) - delta_mu) / delta_sig
+    delta_t = (jnp.asarray(delta_train, dtype=dtype) - jnp.asarray(delta_mu, dtype=dtype)[None, :]) / jnp.asarray(
+        delta_sig, dtype=dtype
+    )[None, :]
+    delta_eval_t = (jnp.asarray(delta_eval, dtype=dtype) - jnp.asarray(delta_mu, dtype=dtype)[None, :]) / jnp.asarray(
+        delta_sig, dtype=dtype
+    )[None, :]
 
     mus = []
     vars_a = []
@@ -150,8 +179,12 @@ def predict_log_n_batch_with_var(model: dict, delta_eval: np.ndarray) -> tuple[n
         Kk = _rbf_kernel(jnp, delta_t, amp[k], ell[k], jit[k])
         Lk = jnp.linalg.cholesky(Kk)
         v = jsp.linalg.solve_triangular(Lk.T, Z[k], lower=False)
-        d = delta_t[:, None] - delta_eval_t[None, :]
-        k_star = (amp[k] ** 2) * jnp.exp(-0.5 * (d**2) / (ell[k] ** 2))
+        ellk = ell[k]
+        if ellk.ndim == 0:
+            ellk = jnp.full((delta_t.shape[1],), ellk, dtype=delta_t.dtype)
+        diff = (delta_t[:, None, :] - delta_eval_t[None, :, :]) / ellk[None, None, :]
+        sq = jnp.sum(diff * diff, axis=-1)
+        k_star = (amp[k] ** 2) * jnp.exp(-0.5 * sq)
         mus.append(k_star.T @ v)
 
         # Latent-function predictive variance: amp^2 - k_*^T K^{-1} k_*
@@ -203,10 +236,12 @@ def poisson_median(lam: np.ndarray) -> np.ndarray:
 def gp_health(model: dict) -> dict[str, np.ndarray]:
     dtype = jnp.float64 if bool(jax.config.read("jax_enable_x64")) else jnp.float32
 
-    delta_train = jnp.asarray(model["delta_train"], dtype=dtype)
-    delta_mu = float(model["delta_mu"])
-    delta_sig = float(model["delta_sig"]) + 1e-12
-    delta_t = (delta_train - delta_mu) / delta_sig
+    delta_mu = np.asarray(model["delta_mu"], dtype=np.float64).reshape(-1)
+    delta_sig = np.asarray(model["delta_sig"], dtype=np.float64).reshape(-1) + 1e-12
+    delta_train = _as_2d(np.asarray(model["delta_train"], dtype=np.float64))
+    delta_t = (jnp.asarray(delta_train, dtype=dtype) - jnp.asarray(delta_mu, dtype=dtype)[None, :]) / jnp.asarray(
+        delta_sig, dtype=dtype
+    )[None, :]
     amp = jnp.exp(jnp.asarray(model["log_amp"], dtype=dtype))
     ell = jnp.exp(jnp.asarray(model["log_ell"], dtype=dtype))
     jit = jnp.exp(jnp.asarray(model["log_jitter"], dtype=dtype))
@@ -240,6 +275,8 @@ def main() -> None:
         default=None,
         help="Kernel radius in Mpc (required if not stored in the model and gridder has multiple kernels).",
     )
+    ap.add_argument("--kernel-radius-1", type=float, default=None, help="First overdensity kernel radius (Mpc).")
+    ap.add_argument("--kernel-radius-2", type=float, default=None, help="Second overdensity kernel radius (Mpc).")
     ap.add_argument("--n-spheres", type=int, default=512)
     ap.add_argument("--seed", type=int, default=1001, help="Seed for held-out sphere selection.")
     ap.add_argument("--outdir", type=Path, default=None, help="Output directory for plots (default: ../plots relative to this script).")
@@ -280,23 +317,43 @@ def main() -> None:
     if gridder_file is None:
         raise ValueError("Gridder file not provided. Pass --gridder-file or retrain a model that stores it.")
 
-    kernel_radius = args.kernel_radius
-    if kernel_radius is None and "kernel_radius" in model:
-        kernel_radius = float(model["kernel_radius"])
-    if kernel_radius is None:
-        kernel_radius = _infer_unique_kernel_radius_from_gridder(gridder_file)
-    if kernel_radius is None:
+    sphere_radius = args.kernel_radius
+    if sphere_radius is None and "kernel_radius" in model:
+        sphere_radius = float(model["kernel_radius"])
+    if sphere_radius is None:
+        sphere_radius = _infer_unique_kernel_radius_from_gridder(gridder_file)
+    if sphere_radius is None:
         raise ValueError(
-            "Kernel radius not available. Provide `--kernel-radius`, or retrain/export a model that stores it "
+            "Sphere radius not available. Provide `--kernel-radius`, or retrain/export a model that stores it "
             "(or ensure your gridder file contains a single KernelRadius)."
         )
+
+    # Determine the two overdensity smoothing radii.
+    kr1 = args.kernel_radius_1
+    kr2 = args.kernel_radius_2
+    if (kr1 is None or kr2 is None) and "kernel_radii" in model:
+        rr = np.asarray(model["kernel_radii"], dtype=np.float64).reshape(-1)
+        if rr.size >= 2:
+            kr1, kr2 = float(rr[0]), float(rr[1])
+    if kr1 is None or kr2 is None:
+        if kr2 is None:
+            kr2 = float(sphere_radius)
+        # Infer the smaller radius from the gridder file.
+        r1_inf, r2_inf = infer_two_smallest_kernel_radii(gridder_file)
+        kr1 = float(r1_inf) if not np.isclose(float(r1_inf), float(kr2), rtol=0, atol=1e-8) else float(r2_inf)
+    kr1, kr2 = float(kr1), float(kr2)
+    if kr2 < kr1:
+        kr1, kr2 = kr2, kr1
+    print(f"kernel_radii {kr1:g} {kr2:g}  sphere_radius {float(sphere_radius):g}")
     log10M_edges = np.asarray(model["log10M_edges"], dtype=np.float64)
     dlog10M = np.diff(log10M_edges)
     log10M_centers = 0.5 * (log10M_edges[:-1] + log10M_edges[1:])
     mass_pivot_msun = float(model.get("mass_pivot_msun", 1e10))
 
     halo_pos, halo_mass, boxsize, _z = read_swift_fof(args.parent_fof)
-    grid_pos, grid_delta = load_gridder_overdensity(gridder_file, kernel_radius=kernel_radius)
+    grid_pos, grid_delta1, grid_delta2 = load_gridder_overdensity_pair(
+        gridder_file, kernel_radius_1=float(kr1), kernel_radius_2=float(kr2)
+    )
 
     train_idx = None
     if "train_center_idx" in model:
@@ -304,18 +361,22 @@ def main() -> None:
         if train_idx.size == 0:
             train_idx = None
     if train_idx is None:
-        idx = _choose_centers_stratified(grid_delta, int(args.n_spheres), int(args.seed))
+        idx = _choose_centers_stratified_2d(grid_delta1, grid_delta2, int(args.n_spheres), int(args.seed))
     else:
-        idx = _choose_centers_stratified_excluding(grid_delta, int(args.n_spheres), int(args.seed), train_idx)
+        idx = _choose_centers_stratified_2d_excluding(
+            grid_delta1, grid_delta2, int(args.n_spheres), int(args.seed), train_idx
+        )
         print(f"excluded_train_centers {int(train_idx.size)}")
     centers = grid_pos[idx]
-    delta = grid_delta[idx]
+    delta_vec = np.stack([np.asarray(grid_delta1, dtype=np.float64)[idx], np.asarray(grid_delta2, dtype=np.float64)[idx]], axis=1)
+    # For 1D plots/colouring, keep using the larger-scale overdensity (second component).
+    delta = np.asarray(delta_vec[:, 1], dtype=np.float64)
 
     from scipy.spatial import cKDTree
 
     L = float(boxsize)
     tree = cKDTree(np.mod(halo_pos, L), boxsize=L)
-    hits = tree.query_ball_point(np.mod(centers, L), r=kernel_radius, workers=-1)
+    hits = tree.query_ball_point(np.mod(centers, L), r=float(sphere_radius), workers=-1)
 
     log10M = np.log10(np.clip(halo_mass, 1e-300, None)) - np.log10(mass_pivot_msun)
     N = np.zeros((int(args.n_spheres), dlog10M.size), dtype=np.int32)
@@ -323,8 +384,8 @@ def main() -> None:
         if ids:
             N[s], _ = np.histogram(log10M[np.asarray(ids, dtype=np.int64)], bins=log10M_edges)
 
-    V = float(4.0 / 3.0 * np.pi * kernel_radius**3)
-    log_n_pred = predict_log_n_batch(model, delta)
+    V = float(4.0 / 3.0 * np.pi * float(sphere_radius) ** 3)
+    log_n_pred = predict_log_n_batch(model, delta_vec)
     if not np.all(np.isfinite(log_n_pred)):
         h = gp_health(model)
         print("Non-finite predictions detected.")
@@ -342,8 +403,11 @@ def main() -> None:
     ll_pred = poisson_loglik_counts(N, lam_pred)
     ll_base = poisson_loglik_counts(N, lam_base)
 
-    print(f"n_spheres {N.shape[0]}  kernel_R {kernel_radius:g} Mpc")
-    print(f"heldout delta[min,max] ({delta.min():.3g},{delta.max():.3g})")
+    print(f"n_spheres {N.shape[0]}  sphere_R {float(sphere_radius):g} Mpc")
+    print(
+        f"heldout delta1[min,max] ({float(np.min(delta_vec[:,0])):.3g},{float(np.max(delta_vec[:,0])):.3g})  "
+        f"delta2[min,max] ({float(np.min(delta_vec[:,1])):.3g},{float(np.max(delta_vec[:,1])):.3g})"
+    )
     print(f"sum N {int(N.sum())}  mean N/sphere {float(N.sum()/N.shape[0]):.3g}")
     print(f"total loglik (pred) {float(ll_pred.sum()):.6g}")
     print(f"total loglik (base) {float(ll_base.sum()):.6g}")
@@ -352,10 +416,11 @@ def main() -> None:
 
     if int(args.mc_delta) > 0:
         rng = np.random.default_rng(int(args.seed) + 77)
-        if grid_delta.size <= int(args.mc_delta):
-            d_mc = np.asarray(grid_delta, dtype=np.float64)
+        if grid_delta2.size <= int(args.mc_delta):
+            d_mc = np.stack([np.asarray(grid_delta1, dtype=np.float64), np.asarray(grid_delta2, dtype=np.float64)], axis=1)
         else:
-            d_mc = rng.choice(np.asarray(grid_delta, dtype=np.float64), size=int(args.mc_delta), replace=False)
+            pick = rng.choice(np.arange(int(grid_delta2.size), dtype=np.int64), size=int(args.mc_delta), replace=False)
+            d_mc = np.stack([np.asarray(grid_delta1, dtype=np.float64)[pick], np.asarray(grid_delta2, dtype=np.float64)[pick]], axis=1)
         log_n_mc = predict_log_n_batch(model, d_mc)
         n_bar = np.mean(np.exp(log_n_mc), axis=0)
         rel = (n_bar - np.exp(log_n_base)) / np.exp(log_n_base)
