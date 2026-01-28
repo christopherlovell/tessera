@@ -377,8 +377,8 @@ def build_parent_dataset(
     log_n_box = np.log(hmf_dn_dlog10M(masses_h, boxsize**3, log10M_edges) + 1e-300)
 
     baseline = str(baseline).lower().strip()
-    if baseline not in {"box", "spheres"}:
-        raise ValueError(f"baseline must be 'box' or 'spheres' (got {baseline!r})")
+    if baseline not in {"box", "spheres", "hybrid"}:
+        raise ValueError(f"baseline must be 'box', 'spheres', or 'hybrid' (got {baseline!r})")
     log_n_base: np.ndarray | None = None
     if baseline == "box":
         log_n_base = log_n_box
@@ -495,6 +495,11 @@ def build_parent_dataset(
             N, V, dlog10M, pseudocount=float(baseline_pseudocount), sphere_weights=w_base
         )
         log_n_base = np.log(np.asarray(n_base, dtype=np.float64) + 1e-300)
+        if baseline == "hybrid":
+            # Anchor the highest-mass bin to the unconditional parent-box HMF, but learn delta-dependent
+            # deviations from the spheres. This uses full-box information only for the tail normalization.
+            if log_n_base.size > 0:
+                log_n_base[-1] = log_n_box[-1]
 
     rng = np.random.default_rng(int(seed) + 1)
     if int(n_delta_q) <= 0:
@@ -734,6 +739,7 @@ def save_emulator(
     delta_train: np.ndarray,
     train_center_idx: np.ndarray | None,
     train_gridder_file: Path | None,
+    baseline_mode: str | None = None,
     beta_tail: float | None = None,
     tail_top_bins: int | None = None,
     tail_eps: float | None = None,
@@ -752,6 +758,8 @@ def save_emulator(
             f.attrs["kernel_radius"] = float(kernel_radius)
             if train_gridder_file is not None:
                 f.attrs["gridder_file"] = str(Path(train_gridder_file))
+            if baseline_mode is not None:
+                f.attrs["baseline_mode"] = str(baseline_mode)
             if beta_tail is not None:
                 f.attrs["beta_tail"] = float(beta_tail)
             if tail_top_bins is not None:
@@ -796,6 +804,11 @@ def save_emulator(
                 if train_gridder_file is not None
                 else {}
             ),
+            **(
+                {"baseline_mode": np.asarray(str(baseline_mode), dtype=np.str_)}
+                if baseline_mode is not None
+                else {}
+            ),
             **({"beta_tail": np.asarray(float(beta_tail), dtype=np.float64)} if beta_tail is not None else {}),
             **({"tail_top_bins": np.asarray(int(tail_top_bins), dtype=np.int64)} if tail_top_bins is not None else {}),
             **({"tail_eps": np.asarray(float(tail_eps), dtype=np.float64)} if tail_eps is not None else {}),
@@ -818,6 +831,11 @@ def load_emulator(path: Path) -> dict[str, np.ndarray | float]:
                 if isinstance(gf, bytes):
                     gf = gf.decode("utf-8")
                 out["gridder_file"] = str(gf)
+            if "baseline_mode" in f.attrs:
+                bm = f.attrs["baseline_mode"]
+                if isinstance(bm, bytes):
+                    bm = bm.decode("utf-8")
+                out["baseline_mode"] = str(bm)
             if "beta_tail" in f.attrs:
                 out["beta_tail"] = float(f.attrs["beta_tail"])
             if "tail_top_bins" in f.attrs:
@@ -848,6 +866,8 @@ def load_emulator(path: Path) -> dict[str, np.ndarray | float]:
         out["mass_pivot_msun"] = 1.0 if float(np.nanmean(edges)) > 8.0 else float(MASS_PIVOT_MSUN)
     if "gridder_file" in out:
         out["gridder_file"] = str(np.asarray(out["gridder_file"]).item())
+    if "baseline_mode" in out:
+        out["baseline_mode"] = str(np.asarray(out["baseline_mode"]).item())
     for k in ["beta_tail", "tail_eps"]:
         if k in out:
             out[k] = float(np.asarray(out[k]).item())
@@ -1102,9 +1122,9 @@ def main():
         "--baseline",
         type=str,
         default="spheres",
-        choices=["box", "spheres"],
-        help="How to set log_n_base. 'box' uses the full-box HMF (requires full-box data); "
-        "'spheres' estimates it from the training spheres (matches the sphere sampling distribution).",
+        choices=["box", "spheres", "hybrid"],
+        help="How to set log_n_base. 'box' uses the full-box HMF; 'spheres' estimates it from the training spheres; "
+        "'hybrid' uses the spheres baseline for all bins except the highest-mass bin, which is anchored to the full box.",
     )
     tr.add_argument(
         "--baseline-pseudocount",
@@ -1148,6 +1168,9 @@ def main():
             baseline=str(args.baseline),
             baseline_pseudocount=float(args.baseline_pseudocount),
         )
+        if str(args.baseline).lower().strip() == "hybrid" and ds.log10M_edges.size >= 2:
+            lo, hi = float(ds.log10M_edges[-2]), float(ds.log10M_edges[-1])
+            print(f"baseline_hybrid anchored_last_bin log10M∈[{lo:.6g},{hi:.6g}] to parent box")
         # Diagnostics for training-set mass coverage.
         print("training_counts_per_bin " + " ".join(str(int(x)) for x in np.asarray(ds.N.sum(axis=0)).tolist()))
         _centres_box, masses_box, _boxsize, _z = read_swift_fof(args.parent_fof)
@@ -1233,6 +1256,7 @@ def main():
             delta_train=np.asarray(ds.delta, dtype=np.float64),
             train_center_idx=np.asarray(ds.center_idx, dtype=np.int64),
             train_gridder_file=args.gridder_file,
+            baseline_mode=str(args.baseline),
             beta_tail=(float(args.beta_tail) if float(args.beta_tail) > 0.0 else None),
             tail_top_bins=(tail_top_bins if float(args.beta_tail) > 0.0 else None),
             tail_eps=(float(args.tail_eps) if float(args.beta_tail) > 0.0 else None),
