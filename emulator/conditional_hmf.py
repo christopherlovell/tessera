@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import jax
+import jax.numpy as jnp
+import jax.scipy as jsp
 
 MSUN_CGS = 1.98841e33
 MASS_PIVOT_MSUN = 1e10  # Plot/fit masses in units of 1e10 Msun.
@@ -69,9 +72,130 @@ def hmf_dn_dlog10M(masses_msun: np.ndarray, volume_mpc3: float, log10M_edges: np
     dlog10M = np.diff(log10M_edges)
     return counts / (float(volume_mpc3) * dlog10M)
 
+def baseline_from_spheres(
+    N: np.ndarray,
+    V: np.ndarray,
+    dlog10M: np.ndarray,
+    *,
+    pseudocount: float = 0.5,
+    sphere_weights: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Estimate an unconditional/baseline HMF from the (sphere, mass-bin) counts.
 
-def _sphere_volume(R: float) -> float:
-    return float(4.0 / 3.0 * np.pi * R**3)
+    This is the Poisson MLE for the per-bin mean number density, aggregating all spheres:
+        n_j = (sum_s N_{s,j} + pseudocount) / (sum_s V_s * dlog10M_j)
+
+    If `sphere_weights` is provided (shape (S,)), we compute the weighted analogue:
+        n_j = (sum_s w_s N_{s,j} + pseudocount) / (sum_s w_s V_s * dlog10M_j).
+
+    Note: this matches the sampling distribution of the spheres. If spheres are selected
+    stratified in overdensity rather than drawn from the true p(delta), this baseline is
+    not an unbiased estimate of the global-box HMF.
+    """
+    N = np.asarray(N, dtype=np.float64)
+    V = np.asarray(V, dtype=np.float64)
+    dlog10M = np.asarray(dlog10M, dtype=np.float64)
+    if sphere_weights is None:
+        tot_counts = np.sum(N, axis=0) + float(pseudocount)
+        tot_vol = float(np.sum(V))
+    else:
+        w = np.asarray(sphere_weights, dtype=np.float64).reshape(-1)
+        if w.size != N.shape[0]:
+            raise ValueError(f"sphere_weights must have shape (S,) with S={N.shape[0]} (got {w.shape})")
+        w = np.where(np.isfinite(w) & (w > 0.0), w, 0.0)
+        if not np.any(w > 0.0):
+            w = np.ones_like(w)
+        w = w / float(np.mean(w))
+        tot_counts = np.sum(w[:, None] * N, axis=0) + float(pseudocount)
+        tot_vol = float(np.sum(w * V))
+    return tot_counts / (tot_vol * dlog10M)
+
+def overdensity_pdf_weights(
+    *,
+    delta_spheres: np.ndarray,
+    delta_parent: np.ndarray,
+    nbins: int = 120,
+    clip_min: float = -1.0 + 1e-12,
+) -> np.ndarray:
+    """
+    Return per-sphere weights proportional to the *global* overdensity PDF evaluated at each sphere's δ.
+
+    We estimate p(δ) from the parent grid's overdensity values using a histogram in
+    x = log10(1+δ) (as used elsewhere for plotting/binning), then convert to p(δ):
+        p(δ) = p(x) / (ln 10 * (1+δ)).
+
+    The returned weights are proportional to p(δ) (up to histogram discretization). Any overall
+    normalization cancels in downstream weighted aggregation.
+    """
+    delta_parent = np.asarray(delta_parent, dtype=np.float64).ravel()
+    if delta_parent.size == 0:
+        return np.ones_like(np.asarray(delta_spheres, dtype=np.float64).ravel())
+
+    nbins = int(nbins)
+    if nbins <= 1:
+        raise ValueError("nbins must be > 1")
+
+    clip_min = float(clip_min)
+    chunk = 2_000_000
+
+    # Pass 1: determine x-range without allocating x for the full grid.
+    x_min = np.inf
+    x_max = -np.inf
+    n_finite = 0
+    for start in range(0, int(delta_parent.size), int(chunk)):
+        d = delta_parent[start : start + int(chunk)]
+        m = np.isfinite(d)
+        if not np.any(m):
+            continue
+        d = np.clip(d[m], clip_min, None)
+        x = np.log10(1.0 + d)
+        x = x[np.isfinite(x)]
+        if x.size == 0:
+            continue
+        n_finite += int(x.size)
+        x_min = min(float(x_min), float(np.min(x)))
+        x_max = max(float(x_max), float(np.max(x)))
+    if not np.isfinite(x_min) or not np.isfinite(x_max) or n_finite == 0 or not (x_max > x_min):
+        return np.ones_like(np.asarray(delta_spheres, dtype=np.float64).ravel())
+
+    edges = np.linspace(float(x_min), float(x_max), nbins + 1, dtype=np.float64)
+    counts = np.zeros(nbins, dtype=np.float64)
+
+    # Pass 2: histogram counts.
+    for start in range(0, int(delta_parent.size), int(chunk)):
+        d = delta_parent[start : start + int(chunk)]
+        m = np.isfinite(d)
+        if not np.any(m):
+            continue
+        d = np.clip(d[m], clip_min, None)
+        x = np.log10(1.0 + d)
+        x = x[np.isfinite(x)]
+        if x.size == 0:
+            continue
+        c, _ = np.histogram(x, bins=edges, density=False)
+        counts += np.asarray(c, dtype=np.float64)
+
+    sw = float(np.sum(counts))
+    if not np.isfinite(sw) or sw <= 0.0:
+        return np.ones_like(np.asarray(delta_spheres, dtype=np.float64).ravel())
+
+    widths = np.diff(edges)
+    hist = counts / (sw * widths)
+
+    ds = np.asarray(delta_spheres, dtype=np.float64).ravel()
+    ds_clip = np.clip(ds, float(clip_min), None)
+    x_s = np.log10(1.0 + ds_clip)
+    bin_idx = np.searchsorted(edges, x_s, side="right") - 1
+    bin_idx = np.clip(bin_idx, 0, hist.size - 1)
+    pdf_x = hist[bin_idx]
+    pdf_delta = pdf_x / (np.log(10.0) * (1.0 + ds_clip))
+    pdf_delta = np.where(np.isfinite(pdf_delta) & (pdf_delta > 0.0), pdf_delta, 0.0)
+
+    pos = pdf_delta[pdf_delta > 0.0]
+    floor = float(np.min(pos)) if pos.size else 1.0
+    pdf_delta = np.where(pdf_delta > 0.0, pdf_delta, floor)
+    return pdf_delta
 
 
 def _choose_centers_stratified(delta: np.ndarray, n: int, seed: int) -> np.ndarray:
@@ -88,16 +212,142 @@ def _choose_centers_stratified(delta: np.ndarray, n: int, seed: int) -> np.ndarr
         idx.append(int(order[j]))
     return np.asarray(idx, dtype=np.int64)
 
+def _choose_centers_stratified_excluding(delta: np.ndarray, n: int, seed: int, exclude_idx: np.ndarray) -> np.ndarray:
+    """
+    Choose `n` indices stratified in `delta`, excluding any indices in `exclude_idx`.
+
+    Returns indices into the original `delta` array.
+    """
+    delta = np.asarray(delta, dtype=np.float64)
+    n = int(n)
+    exclude_idx = np.asarray(exclude_idx, dtype=np.int64).ravel()
+    if exclude_idx.size == 0:
+        return _choose_centers_stratified(delta, n, seed)
+    exclude_idx = np.unique(exclude_idx)
+    if np.any(exclude_idx < 0) or np.any(exclude_idx >= delta.size):
+        raise ValueError("exclude_idx contains out-of-range indices")
+    mask = np.ones(delta.size, dtype=bool)
+    mask[exclude_idx] = False
+    avail = np.nonzero(mask)[0].astype(np.int64)
+    if n <= 0 or n > avail.size:
+        raise ValueError(f"n={n} invalid for available.size={avail.size}")
+    sub = _choose_centers_stratified(delta[avail], n, seed)
+    return avail[np.asarray(sub, dtype=np.int64)]
+
+
+def _periodic_ok(p: np.ndarray, keep_pos: list[np.ndarray], boxsize: float, min_sep2: float) -> bool:
+    if not keep_pos:
+        return True
+    L = float(boxsize)
+    arr = np.stack(keep_pos, axis=0)
+    d = np.abs(arr - p[None, :])
+    d = np.minimum(d, L - d)
+    return bool(np.all(np.sum(d * d, axis=1) >= float(min_sep2)))
+
+
+def _unique_preserve_order(idx: np.ndarray) -> np.ndarray:
+    seen: set[int] = set()
+    out: list[int] = []
+    for ii in np.asarray(idx, dtype=np.int64).tolist():
+        if ii in seen:
+            continue
+        seen.add(int(ii))
+        out.append(int(ii))
+    return np.asarray(out, dtype=np.int64)
+
+
+def _select_nonoverlapping_centers_stratified(
+    *,
+    grid_pos: np.ndarray,
+    delta: np.ndarray,
+    boxsize: float,
+    kernel_radius: float,
+    n_select: int,
+    seed: int,
+    max_attempts: int = 32,
+    avoid_pos: list[np.ndarray] | None = None,
+    exclude_idx: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Choose sphere centers such that spheres of radius `kernel_radius` do not overlap.
+
+    Selection is seeded and enforces stratification in overdensity (one center per stratum)
+    with the additional hard constraint that all chosen centers satisfy separation >= 2R
+    (periodic distances). Any positions in `avoid_pos` are treated as already occupied.
+    """
+    grid_pos = np.asarray(grid_pos, dtype=np.float64)
+    delta = np.asarray(delta, dtype=np.float64)
+    L = float(boxsize)
+    R = float(kernel_radius)
+    n_select = int(n_select)
+    if n_select <= 0:
+        raise ValueError("n_select must be > 0")
+    if grid_pos.shape[0] != delta.shape[0]:
+        raise ValueError("grid_pos and delta must have the same length")
+
+    min_sep2 = (2.0 * R) ** 2
+    pos = np.mod(grid_pos, L)
+
+    avoid_pos = [] if avoid_pos is None else list(avoid_pos)
+    exclude_set: set[int] = set()
+    if exclude_idx is not None:
+        for ii in np.asarray(exclude_idx, dtype=np.int64).ravel().tolist():
+            exclude_set.add(int(ii))
+
+    order = np.argsort(delta)  # ascending δ
+    edges = np.linspace(0, delta.size, n_select + 1, dtype=np.int64)
+    strata = [order[int(a) : int(b)] for a, b in zip(edges[:-1], edges[1:])]
+    if any(s.size == 0 for s in strata):
+        raise RuntimeError("Internal error: empty stratum encountered.")
+
+    for attempt in range(int(max_attempts)):
+        rng = np.random.default_rng(int(seed) + attempt)
+        keep: list[int] = []
+        keep_pos: list[np.ndarray] = list(avoid_pos)
+        used: set[int] = set(exclude_set)
+
+        bins = list(range(n_select))
+        rng.shuffle(bins)
+        success = True
+        for b in bins:
+            cand = np.asarray(strata[int(b)], dtype=np.int64)
+            cand = rng.permutation(cand)
+
+            chosen = None
+            for ii in cand.tolist():
+                if int(ii) in used:
+                    continue
+                p = pos[int(ii)]
+                if _periodic_ok(p, keep_pos, L, min_sep2):
+                    chosen = int(ii)
+                    break
+            if chosen is None:
+                success = False
+                break
+            keep.append(chosen)
+            keep_pos.append(pos[chosen])
+            used.add(chosen)
+
+        if success and len(keep) == n_select:
+            return np.asarray(keep, dtype=np.int64)
+
+    raise RuntimeError(
+        f"Could not select {n_select} non-overlapping spheres (R={R:g}, min center sep={2*R:g}). "
+        "Try reducing --n-spheres, reducing --kernel-radius, or enabling overlaps."
+    )
+
 
 @dataclass(frozen=True)
 class ParentDataset:
     delta: np.ndarray  # (S,)
     V: np.ndarray  # (S,)
     N: np.ndarray  # (S,J) int
+    center_idx: np.ndarray  # (S,) indices into the gridder arrays used for sphere centres
     log10M_edges: np.ndarray  # (J+1,)
     log10M_centers: np.ndarray  # (J,)
     dlog10M: np.ndarray  # (J,)
     log_n_base: np.ndarray  # (J,)
+    log_n_box: np.ndarray  # (J,) unconditional HMF from full box using the same mass bins
     delta_grid: np.ndarray  # (Q,) for p(delta)
 
 
@@ -112,6 +362,11 @@ def build_parent_dataset(
     log10M_min: float | None = None,
     log10M_max: float | None = None,
     n_delta_q: int = 2048,
+    baseline: str = "box",
+    baseline_pseudocount: float = 0.5,
+    include_top_overdense: int = 0,
+    include_top_halos: int = 0,
+    allow_overlap: bool = False,
 ) -> ParentDataset:
     centres_h, masses_h, boxsize, _z = read_swift_fof(parent_fof)
     grid_pos, grid_delta = load_gridder_overdensity(gridder_file, kernel_radius=float(kernel_radius))
@@ -119,9 +374,101 @@ def build_parent_dataset(
     log10M_edges, log10M_centers, dlog10M = log10_mass_bins(
         masses_h, n_bins=int(n_mass_bins), log10M_min=log10M_min, log10M_max=log10M_max
     )
-    log_n_base = np.log(hmf_dn_dlog10M(masses_h, boxsize**3, log10M_edges) + 1e-300)
+    log_n_box = np.log(hmf_dn_dlog10M(masses_h, boxsize**3, log10M_edges) + 1e-300)
 
-    center_idx = _choose_centers_stratified(grid_delta, int(n_spheres), int(seed))
+    baseline = str(baseline).lower().strip()
+    if baseline not in {"box", "spheres"}:
+        raise ValueError(f"baseline must be 'box' or 'spheres' (got {baseline!r})")
+    log_n_base: np.ndarray | None = None
+    if baseline == "box":
+        log_n_base = log_n_box
+
+    n_spheres = int(n_spheres)
+    include_top_overdense = int(include_top_overdense)
+    include_top_halos = int(include_top_halos)
+    if include_top_overdense < 0:
+        raise ValueError(f"include_top_overdense must be >= 0 (got {include_top_overdense})")
+    if include_top_overdense > n_spheres:
+        raise ValueError(
+            f"include_top_overdense={include_top_overdense} cannot exceed n_spheres={n_spheres}"
+        )
+    if include_top_halos < 0:
+        raise ValueError(f"include_top_halos must be >= 0 (got {include_top_halos})")
+    if include_top_halos > n_spheres:
+        raise ValueError(f"include_top_halos={include_top_halos} cannot exceed n_spheres={n_spheres}")
+
+    halo_center_idx = None
+    if include_top_halos > 0:
+        from scipy.spatial import cKDTree
+
+        # Map the positions of the most massive halos to nearest grid points (periodic).
+        L = float(boxsize)
+        gp = np.mod(np.asarray(grid_pos, dtype=np.float64), L)
+        tree_gp = cKDTree(gp, boxsize=L)
+        halo_pos = np.mod(np.asarray(centres_h, dtype=np.float64), L)
+        order_h = np.argsort(np.asarray(masses_h, dtype=np.float64))[::-1]
+        top_h = order_h[: int(include_top_halos)]
+        _, nn = tree_gp.query(halo_pos[top_h], k=1, workers=-1)
+        halo_center_idx = np.asarray(nn, dtype=np.int64)
+
+    forced_parts: list[np.ndarray] = []
+    if halo_center_idx is not None and halo_center_idx.size:
+        forced_parts.append(np.asarray(halo_center_idx, dtype=np.int64))
+    if include_top_overdense > 0:
+        order_desc = np.argsort(np.asarray(grid_delta, dtype=np.float64))[::-1]
+        top_idx = np.asarray(order_desc[:include_top_overdense], dtype=np.int64)
+        forced_parts.append(np.asarray(top_idx, dtype=np.int64))
+    forced_idx = _unique_preserve_order(np.concatenate(forced_parts, axis=0)) if forced_parts else np.zeros(0, dtype=np.int64)
+
+    if forced_idx.size > n_spheres:
+        forced_idx = forced_idx[:n_spheres]
+
+    if bool(allow_overlap):
+        n_rem = int(n_spheres) - int(forced_idx.size)
+        strat_idx = (
+            _choose_centers_stratified_excluding(grid_delta, n_rem, int(seed), forced_idx)
+            if n_rem > 0
+            else np.zeros(0, dtype=np.int64)
+        )
+        center_idx = np.concatenate([forced_idx, np.asarray(strat_idx, dtype=np.int64)], axis=0)
+        if center_idx.size != n_spheres:
+            raise RuntimeError(f"Selection underfilled (got {center_idx.size}, expected {n_spheres}).")
+    else:
+        # Two-stage selection:
+        #  1) force include "halo-selected" and/or top-overdense centres (without overlap),
+        #  2) fill remaining slots with a δ-stratified non-overlapping sample excluding forced centres.
+        L = float(boxsize)
+        R = float(kernel_radius)
+        min_sep2 = (2.0 * R) ** 2
+        pos = np.mod(np.asarray(grid_pos, dtype=np.float64), L)
+
+        keep_forced: list[int] = []
+        keep_forced_pos: list[np.ndarray] = []
+        for ii in np.asarray(forced_idx, dtype=np.int64).tolist():
+            p = pos[int(ii)]
+            if _periodic_ok(p, keep_forced_pos, L, min_sep2):
+                keep_forced.append(int(ii))
+                keep_forced_pos.append(p)
+        forced_keep_idx = np.asarray(keep_forced, dtype=np.int64)
+
+        n_rem = int(n_spheres) - int(forced_keep_idx.size)
+        rem_idx = (
+            _select_nonoverlapping_centers_stratified(
+                grid_pos=grid_pos,
+                delta=grid_delta,
+                boxsize=float(boxsize),
+                kernel_radius=float(kernel_radius),
+                n_select=n_rem,
+                seed=int(seed),
+                avoid_pos=keep_forced_pos,
+                exclude_idx=forced_keep_idx,
+            )
+            if n_rem > 0
+            else np.zeros(0, dtype=np.int64)
+        )
+        center_idx = np.concatenate([forced_keep_idx, np.asarray(rem_idx, dtype=np.int64)], axis=0)
+        if center_idx.size != n_spheres:
+            raise RuntimeError(f"Selection underfilled (got {center_idx.size}, expected {n_spheres}).")
     centers = grid_pos[center_idx]
     delta = grid_delta[center_idx]
 
@@ -140,7 +487,14 @@ def build_parent_dataset(
             continue
         N[s], _ = np.histogram(log10M[np.asarray(ids, dtype=np.int64)], bins=log10M_edges)
 
-    V = np.full(int(n_spheres), _sphere_volume(float(kernel_radius)), dtype=np.float64)
+    V = np.full(int(n_spheres), float(4.0 / 3.0 * np.pi * kernel_radius**3), dtype=np.float64)
+
+    if log_n_base is None:
+        w_base = overdensity_pdf_weights(delta_spheres=delta, delta_parent=grid_delta)
+        n_base = baseline_from_spheres(
+            N, V, dlog10M, pseudocount=float(baseline_pseudocount), sphere_weights=w_base
+        )
+        log_n_base = np.log(np.asarray(n_base, dtype=np.float64) + 1e-300)
 
     rng = np.random.default_rng(int(seed) + 1)
     if int(n_delta_q) <= 0:
@@ -154,10 +508,12 @@ def build_parent_dataset(
         delta=np.asarray(delta, dtype=np.float64),
         V=V,
         N=N,
+        center_idx=np.asarray(center_idx, dtype=np.int64),
         log10M_edges=np.asarray(log10M_edges, dtype=np.float64),
         log10M_centers=np.asarray(log10M_centers, dtype=np.float64),
         dlog10M=np.asarray(dlog10M, dtype=np.float64),
         log_n_base=np.asarray(log_n_base, dtype=np.float64),
+        log_n_box=np.asarray(log_n_box, dtype=np.float64),
         delta_grid=np.asarray(delta_grid, dtype=np.float64),
     )
 
@@ -186,18 +542,6 @@ def pca_mass_basis(
     return np.asarray(Phi, dtype=np.float64)
 
 
-def _jax_imports():
-    try:
-        import jax
-        import jax.numpy as jnp
-        import jax.scipy as jsp
-    except Exception as exc:  # pragma: no cover
-        raise ModuleNotFoundError(
-            "JAX is required for training/prediction; load an environment with `jax` installed."
-        ) from exc
-    return jax, jnp, jsp
-
-
 def _rbf_kernel(jnp, delta: "jnp.ndarray", amp: "jnp.ndarray", ell: "jnp.ndarray", jitter: "jnp.ndarray"):
     d = delta[:, None] - delta[None, :]
     K = (amp**2) * jnp.exp(-0.5 * (d**2) / (ell**2))
@@ -219,10 +563,11 @@ def make_loss_fn(
     delta: np.ndarray,
     delta_q: np.ndarray,
     alpha_cons: float,
+    beta_tail: float = 0.0,
+    tail_top_bins: int = 0,
+    tail_eps: float = 1.0,
     jit: bool = True,
 ):
-    jax, jnp, jsp = _jax_imports()
-
     N = jnp.asarray(N)
     V = jnp.asarray(V)
     dlog10M = jnp.asarray(dlog10M)
@@ -230,7 +575,10 @@ def make_loss_fn(
     Phi = jnp.asarray(Phi)
     delta = jnp.asarray(delta)
     delta_q = jnp.asarray(delta_q)
-    w_q = jnp.full((delta_q.shape[0],), 1.0 / float(delta_q.shape[0]), dtype=delta_q.dtype)
+    use_consistency = bool(float(alpha_cons) > 0.0) and (int(delta_q.shape[0]) > 0)
+    w_q = None
+    if use_consistency:
+        w_q = jnp.full((delta_q.shape[0],), 1.0 / float(delta_q.shape[0]), dtype=delta_q.dtype)
 
     mu_d = jnp.mean(delta)
     sig_d = jnp.std(delta) + 1e-12
@@ -239,6 +587,14 @@ def make_loss_fn(
 
     S, J = N.shape
     K = Phi.shape[0]
+    tail_top_bins = int(tail_top_bins)
+    use_tail = bool(float(beta_tail) > 0.0)
+    if use_tail and not (1 <= tail_top_bins <= int(J)):
+        raise ValueError(f"tail_top_bins={tail_top_bins} invalid for J={int(J)}")
+    tail_j0 = int(J) - int(tail_top_bins) if use_tail else int(J)
+    tail_eps = float(tail_eps)
+    if use_tail and not (tail_eps > 0.0):
+        raise ValueError(f"tail_eps must be > 0 (got {tail_eps})")
 
     def loss(params):
         amp = jnp.exp(params["log_amp"])
@@ -266,17 +622,26 @@ def make_loss_fn(
         # With a = L z, log p(a|theta) = -0.5||z||^2 - sum(log diag(L)) + const.
         lp = -0.5 * jnp.sum(Z**2) - logdet_term
 
-        mus = []
-        for k in range(K):
-            d = delta_t[:, None] - delta_q_t[None, :]
-            k_star = (amp[k] ** 2) * jnp.exp(-0.5 * (d**2) / (ell[k] ** 2))
-            mus.append(k_star.T @ Vvec[k])
-        mus = jnp.stack(mus, axis=0)  # (K,Q)
+        penalty = 0.0
+        if use_consistency:
+            mus = []
+            for k in range(K):
+                d = delta_t[:, None] - delta_q_t[None, :]
+                k_star = (amp[k] ** 2) * jnp.exp(-0.5 * (d**2) / (ell[k] ** 2))
+                mus.append(k_star.T @ Vvec[k])
+            mus = jnp.stack(mus, axis=0)  # (K,Q)
 
-        log_n_q = log_n_base[None, :] + (mus.T @ Phi)
-        n_bar = (w_q[:, None] * jnp.exp(log_n_q)).sum(axis=0)
-        penalty = float(alpha_cons) * jnp.sum((jnp.log(n_bar + 1e-30) - log_n_base) ** 2)
-        return -(ll + lp) + penalty
+            log_n_q = log_n_base[None, :] + (mus.T @ Phi)
+            n_bar = (w_q[:, None] * jnp.exp(log_n_q)).sum(axis=0)
+            penalty = float(alpha_cons) * jnp.sum((jnp.log(n_bar + 1e-30) - log_n_base) ** 2)
+
+        tail = 0.0
+        if use_tail:
+            lam_tail = jnp.sum(lam[:, tail_j0:], axis=1)
+            N_tail = jnp.sum(N[:, tail_j0:], axis=1)
+            tail = jnp.sum((jnp.log(lam_tail + tail_eps) - jnp.log(N_tail + tail_eps)) ** 2)
+
+        return -(ll + lp) + penalty + float(beta_tail) * tail
 
     aux = {"delta_mu": mu_d, "delta_sig": sig_d, "delta_train_t": delta_t}
     return (jax.jit(loss) if jit else loss), aux
@@ -295,8 +660,6 @@ def train_map(
     clip_grad_norm: float = 10.0,
     print_every: int = 200,
 ):
-    jax, jnp, _jsp = _jax_imports()
-
     key = jax.random.key(int(seed))
     params = {
         "log_amp": jnp.full((K,), jnp.log(0.3)),
@@ -369,6 +732,11 @@ def save_emulator(
     delta_mu: float,
     delta_sig: float,
     delta_train: np.ndarray,
+    train_center_idx: np.ndarray | None,
+    train_gridder_file: Path | None,
+    beta_tail: float | None = None,
+    tail_top_bins: int | None = None,
+    tail_eps: float | None = None,
     kernel_radius: float,
 ):
     out = Path(out)
@@ -382,10 +750,20 @@ def save_emulator(
             f.attrs["delta_mu"] = float(delta_mu)
             f.attrs["delta_sig"] = float(delta_sig)
             f.attrs["kernel_radius"] = float(kernel_radius)
+            if train_gridder_file is not None:
+                f.attrs["gridder_file"] = str(Path(train_gridder_file))
+            if beta_tail is not None:
+                f.attrs["beta_tail"] = float(beta_tail)
+            if tail_top_bins is not None:
+                f.attrs["tail_top_bins"] = int(tail_top_bins)
+            if tail_eps is not None:
+                f.attrs["tail_eps"] = float(tail_eps)
             f.create_dataset("Phi", data=np.asarray(Phi, dtype=np.float64))
             f.create_dataset("log10M_edges", data=np.asarray(log10M_edges, dtype=np.float64))
             f.create_dataset("log_n_base", data=np.asarray(log_n_base, dtype=np.float64))
             f.create_dataset("delta_train", data=np.asarray(delta_train, dtype=np.float64))
+            if train_center_idx is not None:
+                f.create_dataset("train_center_idx", data=np.asarray(train_center_idx, dtype=np.int64))
             f.create_dataset("log_amp", data=np.asarray(params["log_amp"]))
             f.create_dataset("log_ell", data=np.asarray(params["log_ell"]))
             f.create_dataset("log_jitter", data=np.asarray(params["log_jitter"]))
@@ -394,19 +772,34 @@ def save_emulator(
 
     np.savez(
         out,
-        Phi=np.asarray(Phi, dtype=np.float64),
-        log10M_edges=np.asarray(log10M_edges, dtype=np.float64),
-        mass_log_base=np.asarray(10, dtype=np.int64),
-        mass_pivot_msun=np.asarray(MASS_PIVOT_MSUN, dtype=np.float64),
-        log_n_base=np.asarray(log_n_base, dtype=np.float64),
-        delta_mu=float(delta_mu),
-        delta_sig=float(delta_sig),
-        delta_train=np.asarray(delta_train, dtype=np.float64),
-        kernel_radius=float(kernel_radius),
-        log_amp=np.asarray(params["log_amp"]),
-        log_ell=np.asarray(params["log_ell"]),
-        log_jitter=np.asarray(params["log_jitter"]),
-        Z=np.asarray(params["Z"]),
+        **{
+            "Phi": np.asarray(Phi, dtype=np.float64),
+            "log10M_edges": np.asarray(log10M_edges, dtype=np.float64),
+            "mass_log_base": np.asarray(10, dtype=np.int64),
+            "mass_pivot_msun": np.asarray(MASS_PIVOT_MSUN, dtype=np.float64),
+            "log_n_base": np.asarray(log_n_base, dtype=np.float64),
+            "delta_mu": float(delta_mu),
+            "delta_sig": float(delta_sig),
+            "delta_train": np.asarray(delta_train, dtype=np.float64),
+            "kernel_radius": float(kernel_radius),
+            "log_amp": np.asarray(params["log_amp"]),
+            "log_ell": np.asarray(params["log_ell"]),
+            "log_jitter": np.asarray(params["log_jitter"]),
+            "Z": np.asarray(params["Z"]),
+            **(
+                {"train_center_idx": np.asarray(train_center_idx, dtype=np.int64)}
+                if train_center_idx is not None
+                else {}
+            ),
+            **(
+                {"gridder_file": np.asarray(str(Path(train_gridder_file)), dtype=np.str_)}
+                if train_gridder_file is not None
+                else {}
+            ),
+            **({"beta_tail": np.asarray(float(beta_tail), dtype=np.float64)} if beta_tail is not None else {}),
+            **({"tail_top_bins": np.asarray(int(tail_top_bins), dtype=np.int64)} if tail_top_bins is not None else {}),
+            **({"tail_eps": np.asarray(float(tail_eps), dtype=np.float64)} if tail_eps is not None else {}),
+        },
     )
 
 
@@ -420,6 +813,17 @@ def load_emulator(path: Path) -> dict[str, np.ndarray | float]:
             for a in ["delta_mu", "delta_sig", "kernel_radius"]:
                 if a in f.attrs:
                     out[a] = float(f.attrs[a])
+            if "gridder_file" in f.attrs:
+                gf = f.attrs["gridder_file"]
+                if isinstance(gf, bytes):
+                    gf = gf.decode("utf-8")
+                out["gridder_file"] = str(gf)
+            if "beta_tail" in f.attrs:
+                out["beta_tail"] = float(f.attrs["beta_tail"])
+            if "tail_top_bins" in f.attrs:
+                out["tail_top_bins"] = int(f.attrs["tail_top_bins"])
+            if "tail_eps" in f.attrs:
+                out["tail_eps"] = float(f.attrs["tail_eps"])
             if "mass_log_base" in f.attrs:
                 out["mass_log_base"] = int(f.attrs["mass_log_base"])
             if "mass_pivot_msun" in f.attrs:
@@ -442,12 +846,17 @@ def load_emulator(path: Path) -> dict[str, np.ndarray | float]:
     elif "log10M_edges" in out:
         edges = np.asarray(out["log10M_edges"], dtype=np.float64)
         out["mass_pivot_msun"] = 1.0 if float(np.nanmean(edges)) > 8.0 else float(MASS_PIVOT_MSUN)
+    if "gridder_file" in out:
+        out["gridder_file"] = str(np.asarray(out["gridder_file"]).item())
+    for k in ["beta_tail", "tail_eps"]:
+        if k in out:
+            out[k] = float(np.asarray(out[k]).item())
+    if "tail_top_bins" in out:
+        out["tail_top_bins"] = int(np.asarray(out["tail_top_bins"]).item())
     return out
 
 
 def predict_log_n(model: dict[str, np.ndarray | float], delta: float) -> tuple[np.ndarray, np.ndarray]:
-    jax, jnp, jsp = _jax_imports()
-
     Phi = jnp.asarray(model["Phi"])
     log_n_base = jnp.asarray(model["log_n_base"])
     log10M_edges = np.asarray(model["log10M_edges"])
@@ -477,16 +886,6 @@ def predict_log_n(model: dict[str, np.ndarray | float], delta: float) -> tuple[n
     log_n = log_n_base + (mu @ Phi)
     return np.asarray(log10M_centers, dtype=np.float64), np.asarray(log_n)
 
-
-def _configure_jax(*, enable_x64: bool, debug_nans: bool) -> None:
-    jax, _jnp, _jsp = _jax_imports()
-    if enable_x64:
-        jax.config.update("jax_enable_x64", True)
-    if debug_nans:
-        jax.config.update("jax_debug_nans", True)
-        jax.config.update("jax_debug_infs", True)
-
-
 def _print_data_summary(ds: ParentDataset, Phi: np.ndarray | None) -> None:
     def rng(x):
         x = np.asarray(x)
@@ -496,9 +895,43 @@ def _print_data_summary(ds: ParentDataset, Phi: np.ndarray | None) -> None:
     print(f"delta[min,max]={rng(ds.delta)} std={float(np.std(ds.delta)):.6g}")
     print(f"counts[min,max]={rng(ds.N)} total={int(ds.N.sum())}")
     print(f"log_n_base[min,max]={rng(ds.log_n_base)}")
+    print(f"log_n_box[min,max]={rng(ds.log_n_box)}")
     print(f"delta_grid[min,max]={rng(ds.delta_grid)}")
     if Phi is not None:
         print(f"Phi shape={Phi.shape} Phi[min,max]={rng(Phi)}")
+
+
+def _plot_training_overabundance(ds: ParentDataset, *, outdir: Path) -> None:
+    """
+    Plot the relative abundance (dn/dlog10M in selected spheres) / (dn/dlog10M in full box).
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    counts = np.asarray(ds.N.sum(axis=0), dtype=np.float64)
+    Vtot = float(np.sum(ds.V))
+    n_spheres = counts / (Vtot * np.asarray(ds.dlog10M, dtype=np.float64))
+    n_box = np.exp(np.asarray(ds.log_n_box, dtype=np.float64))
+    ratio = n_spheres / np.clip(n_box, 1e-300, None)
+
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    out = outdir / "conditional_hmf_train_overabundance.png"
+
+    fig, ax = plt.subplots(figsize=(7.5, 4.8), constrained_layout=True)
+    ax.axhline(1.0, color="k", lw=1, alpha=0.6)
+    ax.plot(ds.log10M_centers, ratio, lw=2)
+    ax.set_yscale("log")
+    ax.set_xlabel(r"$\log_{10}(M / 10^{10}\,M_\odot)$")
+    ax.set_ylabel(r"$(dn/d\log_{10}M)_\mathrm{spheres} \; / \; (dn/d\log_{10}M)_\mathrm{box}$")
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+
+
+def _jax_imports():
+    return jax, jnp, jsp
 
 
 def _initial_params(*, K: int, S: int, seed: int, init_jitter: float):
@@ -522,6 +955,9 @@ def _loss_parts(
     delta: np.ndarray,
     delta_q: np.ndarray,
     alpha_cons: float,
+    beta_tail: float,
+    tail_top_bins: int,
+    tail_eps: float,
     params,
 ):
     jax, jnp, jsp = _jax_imports()
@@ -532,6 +968,17 @@ def _loss_parts(
     Phi = jnp.asarray(Phi)
     delta = jnp.asarray(delta)
     delta_q = jnp.asarray(delta_q)
+    use_consistency = bool(float(alpha_cons) > 0.0) and (int(delta_q.shape[0]) > 0)
+    use_tail = bool(float(beta_tail) > 0.0)
+    tail_top_bins = int(tail_top_bins)
+    if use_tail:
+        J = int(N.shape[1])
+        if not (1 <= tail_top_bins <= J):
+            raise ValueError(f"tail_top_bins={tail_top_bins} invalid for J={J}")
+        tail_j0 = J - tail_top_bins
+    else:
+        tail_j0 = int(N.shape[1])
+    tail_eps = float(tail_eps)
 
     mu_d = jnp.mean(delta)
     sig_d = jnp.std(delta) + 1e-12
@@ -565,22 +1012,32 @@ def _loss_parts(
     ll = _poisson_loglik(jnp, jsp, N, lam)
     lp = -0.5 * jnp.sum(Z**2) - logdet_term
 
-    mus = []
-    for k in range(Phi.shape[0]):
-        d = delta_t[:, None] - delta_q_t[None, :]
-        k_star = (amp[k] ** 2) * jnp.exp(-0.5 * (d**2) / (ell[k] ** 2))
-        mus.append(k_star.T @ Vvec[k])
-    mus = jnp.stack(mus, axis=0)
-    log_n_q = log_n_base[None, :] + (mus.T @ Phi)
-    n_bar = (w_q[:, None] * jnp.exp(log_n_q)).sum(axis=0)
-    penalty = float(alpha_cons) * jnp.sum((jnp.log(n_bar + 1e-30) - log_n_base) ** 2)
+    penalty = 0.0
+    if use_consistency:
+        w_q = jnp.full((delta_q.shape[0],), 1.0 / float(delta_q.shape[0]), dtype=delta_q.dtype)
+        mus = []
+        for k in range(Phi.shape[0]):
+            d = delta_t[:, None] - delta_q_t[None, :]
+            k_star = (amp[k] ** 2) * jnp.exp(-0.5 * (d**2) / (ell[k] ** 2))
+            mus.append(k_star.T @ Vvec[k])
+        mus = jnp.stack(mus, axis=0)
+        log_n_q = log_n_base[None, :] + (mus.T @ Phi)
+        n_bar = (w_q[:, None] * jnp.exp(log_n_q)).sum(axis=0)
+        penalty = float(alpha_cons) * jnp.sum((jnp.log(n_bar + 1e-30) - log_n_base) ** 2)
 
-    loss = -(ll + lp) + penalty
+    tail = 0.0
+    if use_tail:
+        lam_tail = jnp.sum(lam[:, tail_j0:], axis=1)
+        N_tail = jnp.sum(N[:, tail_j0:], axis=1)
+        tail = jnp.sum((jnp.log(lam_tail + tail_eps) - jnp.log(N_tail + tail_eps)) ** 2)
+
+    loss = -(ll + lp) + penalty + float(beta_tail) * tail
     stats = {
         "loss": loss,
         "ll": ll,
         "lp": lp,
         "penalty": penalty,
+        "tail": tail,
         "logdet": logdet_term,
         "lam_min": jnp.min(lam),
         "lam_max": jnp.max(lam),
@@ -596,15 +1053,65 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     tr = sub.add_parser("train", help="Train from parent FOF + gridder overdensity grid.")
-    tr.add_argument("--parent-fof", type=Path, default=Path("/snap7/scratch/dp276/dc-love2/tessera/parent/fof_0011.hdf5"))
-    tr.add_argument("--gridder-file", type=Path, default=Path("/snap7/scratch/dp276/dc-love2/tessera/parent/gridder/gridder_output_512.hdf5"))
+    tr.add_argument("--parent-fof", type=Path, default=Path("/cosma7/data/dp004/dc-love2/data/tessera/parent/fof_0011.hdf5"))
+    tr.add_argument("--gridder-file", type=Path, default=Path("/cosma7/data/dp004/dc-love2/data/tessera/parent/gridder/gridder_output_512.hdf5"))
     tr.add_argument("--kernel-radius", type=float, default=15.0)
     tr.add_argument("--n-spheres", type=int, default=512)
+    tr.add_argument(
+        "--include-top-overdense",
+        type=int,
+        default=0,
+        help="Force-include this many of the most overdense grid points in the training sphere selection.",
+    )
+    tr.add_argument(
+        "--include-top-halos",
+        type=int,
+        default=0,
+        help="Force-include sphere centres at grid points nearest to the top-N most massive halos (by FOF mass).",
+    )
+    tr.add_argument(
+        "--allow-overlap",
+        action="store_true",
+        help="Allow spheres to overlap (default is to enforce non-overlapping spheres).",
+    )
     tr.add_argument("--n-mass-bins", type=int, default=25)
     tr.add_argument("--K", type=int, default=6, help="Number of PCA modes (excluding intercept).")
     tr.add_argument("--steps", type=int, default=5000)
     tr.add_argument("--lr", type=float, default=1e-3)
-    tr.add_argument("--alpha-cons", type=float, default=512.0)
+    tr.add_argument("--alpha-cons", type=float, default=0)
+    tr.add_argument(
+        "--beta-tail",
+        type=float,
+        default=0.0,
+        help="Weight for an additional tail objective: per-sphere squared error between log predicted and log observed "
+        "cumulative counts above a mass threshold. 0 disables.",
+    )
+    tr.add_argument(
+        "--tail-top-bins",
+        type=int,
+        default=1,
+        help="Define the tail as the top-K mass bins.",
+    )
+    tr.add_argument(
+        "--tail-eps",
+        type=float,
+        default=1.0,
+        help="Epsilon added inside logs for the tail objective: log(sum lambda + eps) - log(sum N + eps).",
+    )
+    tr.add_argument(
+        "--baseline",
+        type=str,
+        default="spheres",
+        choices=["box", "spheres"],
+        help="How to set log_n_base. 'box' uses the full-box HMF (requires full-box data); "
+        "'spheres' estimates it from the training spheres (matches the sphere sampling distribution).",
+    )
+    tr.add_argument(
+        "--baseline-pseudocount",
+        type=float,
+        default=0.5,
+        help="Pseudocount used when estimating the baseline from spheres (helps avoid -inf when a bin is empty).",
+    )
     tr.add_argument("--seed", type=int, default=0)
     tr.add_argument("--out", type=Path, default=Path("conditional_hmf_emulator.h5"))
     tr.add_argument("--x64", action="store_true", help="Enable JAX float64 (often fixes GP Cholesky NaNs).")
@@ -623,20 +1130,52 @@ def main():
     args = ap.parse_args()
 
     if args.cmd == "train":
-        if args.debug_nans or args.x64:
-            _configure_jax(enable_x64=bool(args.x64), debug_nans=bool(args.debug_nans))
+        if args.x64:
+            jax.config.update("jax_enable_x64", True)
+        if args.debug_nans:
+            jax.config.update("jax_debug_nans", True)
+            jax.config.update("jax_debug_infs", True)
         ds = build_parent_dataset(
             parent_fof=args.parent_fof,
             gridder_file=args.gridder_file,
             kernel_radius=float(args.kernel_radius),
             n_spheres=int(args.n_spheres),
+            include_top_overdense=int(args.include_top_overdense),
+            include_top_halos=int(args.include_top_halos),
+            allow_overlap=bool(args.allow_overlap),
             seed=int(args.seed),
             n_mass_bins=int(args.n_mass_bins),
+            baseline=str(args.baseline),
+            baseline_pseudocount=float(args.baseline_pseudocount),
         )
+        # Diagnostics for training-set mass coverage.
+        print("training_counts_per_bin " + " ".join(str(int(x)) for x in np.asarray(ds.N.sum(axis=0)).tolist()))
+        _centres_box, masses_box, _boxsize, _z = read_swift_fof(args.parent_fof)
+        log10M_all = np.log10(np.clip(np.asarray(masses_box, dtype=np.float64), 1e-300, None)) - np.log10(MASS_PIVOT_MSUN)
+        box_counts, _ = np.histogram(log10M_all, bins=np.asarray(ds.log10M_edges, dtype=np.float64))
+        print("parent_box_counts_per_bin " + " ".join(str(int(x)) for x in np.asarray(box_counts).tolist()))
+        try:
+            outdir = Path(__file__).resolve().parent.parent / "plots"
+            _plot_training_overabundance(ds, outdir=outdir)
+            print(f"Wrote {outdir / 'conditional_hmf_train_overabundance.png'}")
+        except Exception as e:
+            print(f"Warning: failed to write training overabundance plot: {e}")
         Phi = pca_mass_basis(ds.N, ds.V, ds.dlog10M, ds.log_n_base, K=int(args.K), add_intercept=True)
         if args.check_data:
             _print_data_summary(ds, Phi)
             return
+        J = int(ds.dlog10M.size)
+        tail_top_bins = int(args.tail_top_bins)
+        if float(args.beta_tail) > 0.0:
+            if not (1 <= tail_top_bins <= J):
+                raise ValueError(f"--tail-top-bins={tail_top_bins} invalid for J={J}")
+        tail_j0 = max(0, J - tail_top_bins)
+        if float(args.beta_tail) > 0.0:
+            tail_mass = float(ds.log10M_centers[min(tail_j0, J - 1)]) if J > 0 else float("nan")
+            print(
+                f"tail_objective beta={float(args.beta_tail):g} tail_top_bins={tail_top_bins} "
+                f"tail_log10M_min={tail_mass:.6g} tail_eps={float(args.tail_eps):g}"
+            )
         if args.diagnose_initial:
             params0 = _initial_params(K=Phi.shape[0], S=ds.delta.size, seed=int(args.seed), init_jitter=float(args.init_jitter))
             parts = _loss_parts(
@@ -648,9 +1187,12 @@ def main():
                 delta=ds.delta,
                 delta_q=ds.delta_grid,
                 alpha_cons=float(args.alpha_cons),
+                beta_tail=float(args.beta_tail),
+                tail_top_bins=tail_top_bins,
+                tail_eps=float(args.tail_eps),
                 params=params0,
             )
-            for k in ["loss", "ll", "lp", "penalty", "logdet", "lam_min", "lam_max", "log_n_min", "log_n_max", "Ldiag_min"]:
+            for k in ["loss", "ll", "lp", "penalty", "tail", "logdet", "lam_min", "lam_max", "log_n_min", "log_n_max", "Ldiag_min"]:
                 print(f"{k} {parts[k]:.8e}")
             return
 
@@ -663,6 +1205,9 @@ def main():
             delta=ds.delta,
             delta_q=ds.delta_grid,
             alpha_cons=float(args.alpha_cons),
+            beta_tail=float(args.beta_tail),
+            tail_top_bins=tail_top_bins,
+            tail_eps=float(args.tail_eps),
             jit=not bool(args.no_jit),
         )
         params = train_map(
@@ -686,11 +1231,15 @@ def main():
             delta_mu=float(aux["delta_mu"]),
             delta_sig=float(aux["delta_sig"]),
             delta_train=np.asarray(ds.delta, dtype=np.float64),
+            train_center_idx=np.asarray(ds.center_idx, dtype=np.int64),
+            train_gridder_file=args.gridder_file,
+            beta_tail=(float(args.beta_tail) if float(args.beta_tail) > 0.0 else None),
+            tail_top_bins=(tail_top_bins if float(args.beta_tail) > 0.0 else None),
+            tail_eps=(float(args.tail_eps) if float(args.beta_tail) > 0.0 else None),
             kernel_radius=float(args.kernel_radius),
         )
         print(f"Wrote {args.out}")
     elif args.cmd == "predict":
-        _configure_jax(enable_x64=False, debug_nans=False)
         model = load_emulator(args.model)
         log10M, log_n = predict_log_n(model, float(args.delta))
         for x, y in zip(log10M, log_n):

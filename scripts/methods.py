@@ -623,11 +623,11 @@ def write_swift_zoom_yaml(
 
     # Ensure outputs go into the run directory by using path-valued basenames.
     params.setdefault("Snapshots", {})
-    params["Snapshots"]["basename"] = str(run_dir / "snap")
+    params["Snapshots"]["basename"] = "snap"
     if "FOF" in params and isinstance(params["FOF"], dict):
-        params["FOF"]["basename"] = str(run_dir / "fof")
+        params["FOF"]["basename"] = "fof"
     if "CSDS" in params and isinstance(params["CSDS"], dict):
-        params["CSDS"]["basename"] = str(run_dir / "csds_index")
+        params["CSDS"]["basename"] = "csds_index"
 
     # SWIFT's parameter reader expects some sequences to be written in flow-style (e.g. `[0, 1, 0]`)
     # rather than block-style dashes. Force flow-style for all YAML sequences.

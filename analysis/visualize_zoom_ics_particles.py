@@ -49,6 +49,25 @@ def read_boxsize_mpc(f: h5py.File) -> float:
     return float(box_attr.reshape(-1)[0])
 
 
+def read_const_mass_from_masstable(f: h5py.File, part_key: str) -> float | None:
+    """
+    If a PartType group does not have a Masses dataset, SWIFT/Gadget-style ICs may
+    specify a constant particle mass via Header/MassTable.
+    """
+    try:
+        idx = int(str(part_key).replace("PartType", ""))
+    except ValueError:
+        return None
+    header = f.get("Header")
+    if header is None or "MassTable" not in header.attrs:
+        return None
+    mt = np.array(header.attrs["MassTable"]).reshape(-1)
+    if idx < 0 or idx >= mt.size:
+        return None
+    m = float(mt[idx])
+    return m if m > 0 else None
+
+
 def unwrap_relative(pos: np.ndarray, center: np.ndarray, box: float) -> np.ndarray:
     half = 0.5 * float(box)
     delta = pos - center[None, :]
@@ -174,6 +193,7 @@ def plot_samples(
     halfwidth: np.ndarray,
     *,
     title: str,
+    total_counts: dict[float, int] | None = None,
     s: float = 0.4,
     alpha: float = 0.4,
 ) -> None:
@@ -189,17 +209,27 @@ def plot_samples(
     cmap = plt.get_cmap("tab20" if n_bins <= 20 else "turbo")
     colors = [cmap(i / max(1, n_bins - 1)) for i in range(n_bins)]
 
-    for ax, (i, j, xi, yi) in zip(axes, projs):
+    handles: list[object] = []
+    labels: list[str] = []
+
+    for ax_idx, (ax, (i, j, xi, yi)) in enumerate(zip(axes, projs)):
         for (idx, (mass, pts)) in enumerate(plotted):
-            ax.scatter(
+            total = None if total_counts is None else total_counts.get(mass)
+            total_txt = "" if total is None else f"total={total:,}, "
+            label = f"m={mass:.6g} ({total_txt}inwin={samples[mass].seen:,}, plot={pts.shape[0]:,})"
+
+            sc = ax.scatter(
                 pts[:, i],
                 pts[:, j],
                 s=s,
                 alpha=alpha,
                 color=colors[idx],
                 rasterized=True,
-                label=f"m={mass:.6g} (seen={samples[mass].seen:,}, plot={pts.shape[0]:,})",
+                label=label,
             )
+            if ax_idx == 0:
+                handles.append(sc)
+                labels.append(label)
         ax.set_xlim(-halfwidth[i], halfwidth[i])
         ax.set_ylim(-halfwidth[j], halfwidth[j])
         ax.set_xlabel(f"{xi} - center [Mpc]")
@@ -207,8 +237,20 @@ def plot_samples(
         ax.set_aspect("equal")
 
     fig.suptitle(title, fontsize=11, y=0.98)
-    axes[-1].legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8, frameon=False)
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.92))
+    bottom = 0.08
+    if handles:
+        ncol = 1 if len(handles) <= 6 else 2
+        bottom = 0.12 if ncol == 1 else 0.18
+        fig.legend(
+            handles,
+            labels,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.02),
+            fontsize=8,
+            frameon=False,
+            ncol=ncol,
+        )
+    fig.tight_layout(rect=(0.0, bottom, 1.0, 0.92))
 
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=200)
@@ -331,6 +373,8 @@ def main() -> None:
 
         # Collect reservoirs per (rounded) mass.
         reservoirs: dict[float, Reservoir] = {}
+        mass_totals_all: dict[float, int] = {}
+        mass_totals_by_type: dict[str, dict[float, int]] = {}
 
         part_keys = [k for k in f.keys() if k.startswith("PartType")]
         if args.types is not None:
@@ -353,6 +397,8 @@ def main() -> None:
                 continue
             coords_ds = g["Coordinates"]
             masses_ds = g["Masses"] if "Masses" in g else None
+            const_mass = read_const_mass_from_masstable(f, pkey)
+            has_variable_masses = masses_ds is not None and const_mass is None
             n = int(coords_ds.shape[0])
             if n == 0:
                 continue
@@ -360,10 +406,29 @@ def main() -> None:
             print(f"{pkey}: n={n:,}")
             if pkey == "PartType1":
                 pt1_total = n
+
+            if const_mass is not None:
+                mkey = float(np.round(const_mass, decimals=12))
+                per_type = mass_totals_by_type.setdefault(pkey, {})
+                per_type[mkey] = per_type.get(mkey, 0) + n
+                mass_totals_all[mkey] = mass_totals_all.get(mkey, 0) + n
+
             for start in range(0, n, int(args.chunk)):
+                stop = min(start + int(args.chunk), n)
+                masses_chunk = None
+                if has_variable_masses:
+                    masses_chunk = np.array(masses_ds[start:stop], dtype=np.float64)
+                    keys_all = np.round(masses_chunk, decimals=12)
+                    uniq_all, counts_all = np.unique(keys_all, return_counts=True)
+                    per_type = mass_totals_by_type.setdefault(pkey, {})
+                    for u, c in zip(uniq_all, counts_all):
+                        mk = float(u)
+                        cnt = int(c)
+                        per_type[mk] = per_type.get(mk, 0) + cnt
+                        mass_totals_all[mk] = mass_totals_all.get(mk, 0) + cnt
+
                 if args.scan_fraction < 1.0 and rng.random() > float(args.scan_fraction):
                     continue
-                stop = min(start + int(args.chunk), n)
                 coords = np.array(coords_ds[start:stop], dtype=np.float64)
                 rel = unwrap_relative(coords, center_mpc, box)
                 if pkey == "PartType1" and args.print_extents:
@@ -391,10 +456,14 @@ def main() -> None:
                     continue
                 rel_in = rel[mask]
 
-                if masses_ds is None:
+                if const_mass is not None:
+                    fill = float(const_mass)
+                    masses = np.full(rel_in.shape[0], fill, dtype=np.float64)
+                elif masses_ds is None:
                     masses = np.full(rel_in.shape[0], np.nan, dtype=np.float64)
                 else:
-                    masses = np.array(masses_ds[start:stop], dtype=np.float64)[mask]
+                    assert masses_chunk is not None
+                    masses = masses_chunk[mask]
 
                 # Group by (rounded) mass for stable binning.
                 keys = np.round(masses, decimals=12)
@@ -428,8 +497,13 @@ def main() -> None:
                 print(f"  scanned in zoom box (no pad): {pt1_in_zoom:,}")
                 print(f"  scanned in zoom+pad box:      {pt1_in_pad:,}")
 
+        if "PartType2" in mass_totals_by_type:
+            print("\nPartType2 mass totals (entire file):")
+            for m, c in sorted(mass_totals_by_type["PartType2"].items(), key=lambda kv: kv[0], reverse=True):
+                print(f"  m={m:.6g}: total={c:,}")
+
     title = f"{Path(args.ics).name} (centered)\nbox={box:.3f} Mpc, pad={args.pad:g} Mpc"
-    plot_samples(args.out, reservoirs, halfwidth, title=title)
+    plot_samples(args.out, reservoirs, halfwidth, title=title, total_counts=mass_totals_all)
     print(f"Saved plot to {args.out}")
 
 

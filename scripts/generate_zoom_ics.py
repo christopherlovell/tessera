@@ -11,6 +11,7 @@ Inputs:
 import argparse
 import configparser
 import os
+import re
 import sys
 from pathlib import Path
 import shutil
@@ -948,7 +949,20 @@ def main():
     else:
         dest = run_dir / "submit_zoom.slurm"
         shutil.copy2(submit_script, dest)
-        # print(f"Copied submit script to {dest} (source: {submit_script})")
+        job_name_raw = (args.label or f"{zoom_index:04d}").strip()
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", job_name_raw).strip("._-")
+        job_name = safe[:64] if safe else f"{zoom_index:04d}"
+        text = dest.read_text()
+        new_text, n = re.subn(r"(?m)^#SBATCH\s+-J\s+.*$", f"#SBATCH -J {job_name}", text, count=1)
+        if n == 0:
+            lines = text.splitlines()
+            if lines and lines[0].startswith("#!"):
+                lines.insert(1, f"#SBATCH -J {job_name}")
+            else:
+                lines.insert(0, f"#SBATCH -J {job_name}")
+            new_text = "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+        dest.write_text(new_text)
+        print(f"Copied submit script to {dest} (source: {submit_script}, job name: {job_name})")
 
     # Copy MUSIC2 helper script for convenience.
     if not DEFAULT_MUSIC2_HELPER.exists():
