@@ -269,15 +269,18 @@ def plot_global_hmf_comparison(
 
     with np.errstate(divide="ignore", invalid="ignore"):
         ratio = n_pred / n_true
-        ratio_lo = n_pred / n_true_hi
-        ratio_hi = n_pred / n_true_lo
+        # Shot-noise (Poisson) uncertainty on the *true* curve only (Garwood interval).
+        # Plot as a band around 1 in ratio space.
+        shot_lo = n_true_lo / n_true
+        shot_hi = n_true_hi / n_true
     axr.axhline(1.0, color="k", lw=1, alpha=0.6)
+    axr.fill_between(log10M, shot_lo, shot_hi, alpha=0.18, linewidth=0, color="k", label="Shot noise (Garwood 1σ)")
     axr.plot(log10M, ratio, lw=2)
-    axr.fill_between(log10M, ratio_lo, ratio_hi, alpha=0.20, linewidth=0)
     axr.set_xlabel(r"$\log_{10}(M / 10^{10}\,M_\odot)$")
     axr.set_ylabel("Pred / true")
     axr.set_ylim(0.0, 2.0)
     axr.grid(True, alpha=0.2)
+    axr.legend(frameon=False, loc="best")
 
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)

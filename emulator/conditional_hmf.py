@@ -53,6 +53,7 @@ def log10_mass_bins(
     n_bins: int,
     log10M_min: float | None = None,
     log10M_max: float | None = None,
+    last_bin_ratio: float = 1.2,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     masses_msun = np.asarray(masses_msun, dtype=np.float64)
     log10M = np.log10(np.clip(masses_msun, 1e-300, None)) - np.log10(MASS_PIVOT_MSUN)
@@ -60,7 +61,24 @@ def log10_mass_bins(
         log10M_min = float(np.min(log10M))
     if log10M_max is None:
         log10M_max = float(np.max(log10M))
-    edges = np.linspace(log10M_min, log10M_max, int(n_bins) + 1)
+    n_bins = int(n_bins)
+    if n_bins < 2:
+        raise ValueError("n_bins must be >= 2")
+    last_bin_ratio = float(last_bin_ratio)
+    if not np.isfinite(last_bin_ratio) or last_bin_ratio <= 0.0:
+        raise ValueError(f"last_bin_ratio must be finite and > 0 (got {last_bin_ratio})")
+
+    # Use equal-width bins except allow the final bin to be wider by `last_bin_ratio`.
+    # The total range [min,max] is preserved by shrinking the earlier bins accordingly.
+    if np.isclose(last_bin_ratio, 1.0, rtol=0, atol=1e-12):
+        edges = np.linspace(log10M_min, log10M_max, n_bins + 1)
+    else:
+        total = float(log10M_max - log10M_min)
+        base = total / float((n_bins - 1) + last_bin_ratio)
+        widths = np.full(n_bins, base, dtype=np.float64)
+        widths[-1] = base * last_bin_ratio
+        edges = log10M_min + np.concatenate([[0.0], np.cumsum(widths)])
+        edges[-1] = float(log10M_max)
     dlog10M = np.diff(edges)
     centers = 0.5 * (edges[:-1] + edges[1:])
     return edges, centers, dlog10M
@@ -359,10 +377,12 @@ def build_parent_dataset(
     n_spheres: int = 512,
     seed: int = 0,
     n_mass_bins: int = 25,
+    last_bin_ratio: float = 1.2,
     log10M_min: float | None = None,
     log10M_max: float | None = None,
     n_delta_q: int = 2048,
     baseline: str = "box",
+    baseline_weight: str = "uniform",
     baseline_pseudocount: float = 0.5,
     include_top_overdense: int = 0,
     include_top_halos: int = 0,
@@ -372,13 +392,20 @@ def build_parent_dataset(
     grid_pos, grid_delta = load_gridder_overdensity(gridder_file, kernel_radius=float(kernel_radius))
 
     log10M_edges, log10M_centers, dlog10M = log10_mass_bins(
-        masses_h, n_bins=int(n_mass_bins), log10M_min=log10M_min, log10M_max=log10M_max
+        masses_h,
+        n_bins=int(n_mass_bins),
+        log10M_min=log10M_min,
+        log10M_max=log10M_max,
+        last_bin_ratio=float(last_bin_ratio),
     )
     log_n_box = np.log(hmf_dn_dlog10M(masses_h, boxsize**3, log10M_edges) + 1e-300)
 
     baseline = str(baseline).lower().strip()
-    if baseline not in {"box", "spheres", "hybrid"}:
-        raise ValueError(f"baseline must be 'box', 'spheres', or 'hybrid' (got {baseline!r})")
+    if baseline not in {"box", "spheres"}:
+        raise ValueError(f"baseline must be 'box' or 'spheres' (got {baseline!r})")
+    baseline_weight = str(baseline_weight).lower().strip()
+    if baseline_weight not in {"uniform", "pdf"}:
+        raise ValueError(f"baseline_weight must be 'uniform' or 'pdf' (got {baseline_weight!r})")
     log_n_base: np.ndarray | None = None
     if baseline == "box":
         log_n_base = log_n_box
@@ -490,7 +517,9 @@ def build_parent_dataset(
     V = np.full(int(n_spheres), float(4.0 / 3.0 * np.pi * kernel_radius**3), dtype=np.float64)
 
     if log_n_base is None:
-        w_base = overdensity_pdf_weights(delta_spheres=delta, delta_parent=grid_delta)
+        w_base = None
+        if baseline_weight == "pdf":
+            w_base = overdensity_pdf_weights(delta_spheres=delta, delta_parent=grid_delta)
         n_base = baseline_from_spheres(
             N, V, dlog10M, pseudocount=float(baseline_pseudocount), sphere_weights=w_base
         )
@@ -1095,6 +1124,13 @@ def main():
         help="Allow spheres to overlap (default is to enforce non-overlapping spheres).",
     )
     tr.add_argument("--n-mass-bins", type=int, default=25)
+    tr.add_argument(
+        "--last-bin-ratio",
+        type=float,
+        default=1.2,
+        help="Make the final mass bin wider by this factor (while keeping the overall [min,max] range fixed). "
+        "Set to 1 for equal-width bins.",
+    )
     tr.add_argument("--K", type=int, default=6, help="Number of PCA modes (excluding intercept).")
     tr.add_argument("--steps", type=int, default=5000)
     tr.add_argument("--lr", type=float, default=1e-3)
@@ -1125,6 +1161,14 @@ def main():
         choices=["box", "spheres", "hybrid"],
         help="How to set log_n_base. 'box' uses the full-box HMF; 'spheres' estimates it from the training spheres; "
         "'hybrid' uses the spheres baseline for all bins except the highest-mass bin, which is anchored to the full box.",
+    )
+    tr.add_argument(
+        "--baseline-weight",
+        type=str,
+        default="uniform",
+        choices=["uniform", "pdf"],
+        help="When --baseline=spheres, how to weight spheres when estimating the baseline. "
+        "'uniform' gives each sphere equal weight; 'pdf' weights each sphere by the global overdensity PDF p(delta).",
     )
     tr.add_argument(
         "--baseline-pseudocount",
@@ -1165,13 +1209,16 @@ def main():
             allow_overlap=bool(args.allow_overlap),
             seed=int(args.seed),
             n_mass_bins=int(args.n_mass_bins),
+            last_bin_ratio=float(args.last_bin_ratio),
             baseline=str(args.baseline),
+            baseline_weight=str(args.baseline_weight),
             baseline_pseudocount=float(args.baseline_pseudocount),
         )
         if str(args.baseline).lower().strip() == "hybrid" and ds.log10M_edges.size >= 2:
             lo, hi = float(ds.log10M_edges[-2]), float(ds.log10M_edges[-1])
             print(f"baseline_hybrid anchored_last_bin log10M∈[{lo:.6g},{hi:.6g}] to parent box")
         # Diagnostics for training-set mass coverage.
+        print("log10M_edges " + " ".join(f"{float(x):.8g}" for x in np.asarray(ds.log10M_edges, dtype=np.float64).tolist()))
         print("training_counts_per_bin " + " ".join(str(int(x)) for x in np.asarray(ds.N.sum(axis=0)).tolist()))
         _centres_box, masses_box, _boxsize, _z = read_swift_fof(args.parent_fof)
         log10M_all = np.log10(np.clip(np.asarray(masses_box, dtype=np.float64), 1e-300, None)) - np.log10(MASS_PIVOT_MSUN)
