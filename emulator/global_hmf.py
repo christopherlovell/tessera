@@ -299,7 +299,7 @@ def plot_overdensity_distribution_2d(
     label2: str = r"$\log_{10}(1+\delta_2)$",
 ) -> None:
     """
-    Plot a 2D histogram of (log10(1+delta1), log10(1+delta2)).
+    Plot a 2D histogram of (log10(1+delta1), log10(1+delta2)) with marginal PDFs.
     """
     import matplotlib
 
@@ -310,7 +310,12 @@ def plot_overdensity_distribution_2d(
     delta12 = np.asarray(delta12, dtype=np.float64)
     if delta12.ndim != 2 or delta12.shape[1] != 2:
         raise ValueError("delta12 must have shape (N,2)")
-    m = np.isfinite(delta12[:, 0]) & np.isfinite(delta12[:, 1]) & (delta12[:, 0] > float(clip_min)) & (delta12[:, 1] > float(clip_min))
+    m = (
+        np.isfinite(delta12[:, 0])
+        & np.isfinite(delta12[:, 1])
+        & (delta12[:, 0] > float(clip_min))
+        & (delta12[:, 1] > float(clip_min))
+    )
     if not np.any(m):
         raise ValueError("No valid delta samples for 2D plotting.")
     d1 = np.clip(delta12[m, 0], float(clip_min), None)
@@ -318,15 +323,12 @@ def plot_overdensity_distribution_2d(
     x1 = np.log10(1.0 + d1)
     x2 = np.log10(1.0 + d2)
 
-    H, xedges, yedges = np.histogram2d(x1, x2, bins=int(nbins))
+    nb = int(nbins)
+    H, xedges, yedges = np.histogram2d(x1, x2, bins=nb)
     corr = float(np.corrcoef(x1, x2)[0, 1]) if x1.size >= 2 else float("nan")
 
-    fig, ax = plt.subplots(figsize=(7.2, 6.2), constrained_layout=True)
-    vmax = float(np.max(H)) if H.size else 1.0
-    norm = LogNorm(vmin=1.0, vmax=max(vmax, 1.0))
-    im = ax.pcolormesh(xedges, yedges, H.T, shading="auto", norm=norm, cmap="viridis")
-    cbar = fig.colorbar(im, ax=ax, pad=0.02)
-    cbar.set_label("Count per bin")
+    xs1 = None
+    xs2 = None
     if delta_selected is not None:
         ds = np.asarray(delta_selected, dtype=np.float64)
         if ds.ndim == 2 and ds.shape[1] == 2:
@@ -339,12 +341,42 @@ def plot_overdensity_distribution_2d(
             if np.any(ms):
                 xs1 = np.log10(1.0 + np.clip(ds[ms, 0], float(clip_min), None))
                 xs2 = np.log10(1.0 + np.clip(ds[ms, 1], float(clip_min), None))
-                ax.scatter(xs1, xs2, s=10, c="tab:orange", alpha=0.6, linewidths=0, label=f"Selected (S={int(xs1.size)})")
+
+    fig = plt.figure(figsize=(8.2, 7.2), constrained_layout=True)
+    gs = fig.add_gridspec(2, 2, width_ratios=[4.0, 1.4], height_ratios=[1.4, 4.0], wspace=0.05, hspace=0.05)
+    ax_top = fig.add_subplot(gs[0, 0])
+    ax = fig.add_subplot(gs[1, 0], sharex=ax_top)
+    ax_right = fig.add_subplot(gs[1, 1], sharey=ax)
+
+    vmax = float(np.max(H)) if H.size else 1.0
+    norm = LogNorm(vmin=1.0, vmax=max(vmax, 1.0))
+    im = ax.pcolormesh(xedges, yedges, H.T, shading="auto", norm=norm, cmap="viridis")
+    cbar = fig.colorbar(im, ax=[ax, ax_top, ax_right], pad=0.01, fraction=0.046)
+    cbar.set_label("Count per bin")
+
+    if xs1 is not None and xs2 is not None:
+        ax.scatter(xs1, xs2, s=10, c="tab:orange", alpha=0.45, linewidths=0, label=f"Selected (S={int(xs1.size)})")
+        ax.legend(loc="best", frameon=False)
+
     ax.set_xlabel(label1)
     ax.set_ylabel(label2)
     ax.set_title(f"Overdensity 2D histogram (N={int(x1.size):,}, corr={corr:.3f})")
-    if delta_selected is not None:
-        ax.legend(loc="best", frameon=False)
+
+    ax_top.hist(x1, bins=xedges, density=True, histtype="step", lw=1.5, color="tab:blue", label="Parent")
+    if xs1 is not None:
+        ax_top.hist(xs1, bins=xedges, density=True, histtype="step", lw=1.5, color="tab:orange", label="Selected")
+    ax_top.set_ylabel("PDF")
+    ax_top.tick_params(axis="x", labelbottom=False)
+    ax_top.grid(True, alpha=0.15)
+    ax_top.legend(loc="best", frameon=False)
+
+    ax_right.hist(x2, bins=yedges, density=True, histtype="step", lw=1.5, color="tab:blue", orientation="horizontal")
+    if xs2 is not None:
+        ax_right.hist(xs2, bins=yedges, density=True, histtype="step", lw=1.5, color="tab:orange", orientation="horizontal")
+    ax_right.set_xlabel("PDF")
+    ax_right.tick_params(axis="y", labelleft=False)
+    ax_right.grid(True, alpha=0.15)
+
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=200)
