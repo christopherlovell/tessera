@@ -247,6 +247,13 @@ def main() -> None:
     ap.add_argument("--outdir", type=Path, default=None, help="Output directory for plots (default: ../plots relative to this script).")
     ap.add_argument("--no-plots", action="store_true")
     ap.add_argument("--mc-delta", type=int, default=2048, help="MC samples for consistency check (0 disables).")
+    ap.add_argument(
+        "--hmf-at-delta",
+        type=float,
+        default=None,
+        help="If set, write a plot of the emulator-predicted HMF at this overdensity value (with GP uncertainty band). "
+        "If omitted, uses the median held-out delta.",
+    )
     ap.add_argument("--x64", action="store_true", help="Enable JAX float64 (often fixes prediction Cholesky NaNs).")
     ap.add_argument("--cpu", action="store_true", help="Force JAX to use CPU (set JAX_PLATFORM_NAME=cpu).")
     ap.add_argument("--debug-nans", action="store_true", help="Enable JAX NaN/Inf debugging.")
@@ -479,6 +486,34 @@ def main() -> None:
     clo, chi = poisson_garwood_1sigma(N)
     n_lo = clo / (V * dlog10M[None, :])
     n_hi = chi / (V * dlog10M[None, :])
+
+    # Emulator-predicted HMF at a single overdensity, with GP uncertainty propagated.
+    # Assumes log n(M|delta) is approximately Normal with variance from predict_log_n_batch_with_var.
+    try:
+        delta0 = float(args.hmf_at_delta) if args.hmf_at_delta is not None else float(np.median(delta))
+        mean_log_n0, var_log_n0 = predict_log_n_batch_with_var(model, np.asarray([delta0], dtype=np.float64))
+        mean_log_n0 = np.asarray(mean_log_n0, dtype=np.float64).reshape(-1)
+        var_log_n0 = np.asarray(var_log_n0, dtype=np.float64).reshape(-1)
+        sd0 = np.sqrt(np.maximum(var_log_n0, 0.0))
+        n_med0 = np.exp(mean_log_n0)  # median under lognormal assumption
+        n_mean0 = np.exp(mean_log_n0 + 0.5 * var_log_n0)  # lognormal mean
+        n_lo0 = np.exp(mean_log_n0 - sd0)
+        n_hi0 = np.exp(mean_log_n0 + sd0)
+
+        fig, ax = plt.subplots(figsize=(7.5, 5.5), constrained_layout=True)
+        ax.fill_between(log10M_centers, n_lo0, n_hi0, alpha=0.22, linewidth=0, label="Emulator GP 68% (lognormal)")
+        ax.plot(log10M_centers, n_mean0, lw=2, label="Emulator mean")
+        ax.plot(log10M_centers, n_med0, lw=1.8, ls="-.", label="Emulator median")
+        ax.plot(log10M_centers, np.exp(log_n_base), lw=1.6, ls="--", color="0.35", label="Baseline")
+        ax.set_yscale("log")
+        ax.set_xlabel(r"$\log_{10}(M / 10^{10}\,M_\odot)$")
+        ax.set_ylabel(r"$dn/d\log_{10}M\;[\mathrm{Mpc}^{-3}]$")
+        ax.set_title(rf"Predicted HMF at $\delta_R={delta0:.3g}$")
+        ax.legend(frameon=False)
+        fig.savefig(outdir / "conditional_hmf_eval_hmf_at_delta.png", dpi=150)
+        plt.close(fig)
+    except Exception as e:
+        print(f"Warning: failed to write conditional_hmf_eval_hmf_at_delta.png: {e}")
 
     # Predicted/observed HMF as a function of overdensity (binned in log(1+delta)).
     # This visualizes how the conditional HMF changes across environments.
