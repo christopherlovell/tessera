@@ -451,6 +451,24 @@ def main() -> None:
     fig.savefig(outdir / "conditional_hmf_eval_counts.png", dpi=150)
     plt.close(fig)
 
+    # Plot the baseline model (dn/dlog10M) on its own, and compare to the unconditional full-box HMF.
+    # This helps interpret cases where the evaluation "baseline counts" curve looks non-HMF-like
+    # (it is the baseline density multiplied by bin width and number of spheres).
+    box_counts, _ = np.histogram(log10M, bins=log10M_edges)
+    n_box = box_counts / (float(boxsize) ** 3 * dlog10M)
+    n_base_model = np.exp(log_n_base)
+    baseline_mode = str(model.get("baseline_mode", model.get("baseline", "unknown")))
+
+    fig, ax = plt.subplots(figsize=(7.5, 5.5), constrained_layout=True)
+    ax.plot(log10M_centers, n_box, lw=2, label="Parent box (unconditional)")
+    ax.plot(log10M_centers, n_base_model, lw=2, ls="--", label=f"Model baseline (mode={baseline_mode})")
+    ax.set_yscale("log")
+    ax.set_xlabel(r"$\log_{10}(M / 10^{10}\,M_\odot)$")
+    ax.set_ylabel(r"$dn/d\log_{10}M\;[\mathrm{Mpc}^{-3}]$")
+    ax.legend(frameon=False)
+    fig.savefig(outdir / "conditional_hmf_eval_baseline_model.png", dpi=150)
+    plt.close(fig)
+
     dll = ll_pred - ll_base
     fig, ax = plt.subplots(figsize=(7.5, 4.5), constrained_layout=True)
     ax.hist(dll, bins=40, histtype="stepfilled", alpha=0.8)

@@ -126,6 +126,7 @@ def log10_mass_bins(
     n_bins: int,
     log10M_min: float | None = None,
     log10M_max: float | None = None,
+    last_bin_ratio: float = 1.2,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     masses_msun = np.asarray(masses_msun, dtype=np.float64)
     log10M = np.log10(np.clip(masses_msun, 1e-300, None)) - np.log10(MASS_PIVOT_MSUN)
@@ -133,7 +134,24 @@ def log10_mass_bins(
         log10M_min = float(np.min(log10M))
     if log10M_max is None:
         log10M_max = float(np.max(log10M))
-    edges = np.linspace(log10M_min, log10M_max, int(n_bins) + 1)
+    n_bins = int(n_bins)
+    if n_bins < 2:
+        raise ValueError("n_bins must be >= 2")
+    last_bin_ratio = float(last_bin_ratio)
+    if not np.isfinite(last_bin_ratio) or last_bin_ratio <= 0.0:
+        raise ValueError(f"last_bin_ratio must be finite and > 0 (got {last_bin_ratio})")
+
+    # Use equal-width bins except allow the final bin to be wider by `last_bin_ratio`.
+    # The total range [min,max] is preserved by shrinking the earlier bins accordingly.
+    if np.isclose(last_bin_ratio, 1.0, rtol=0, atol=1e-12):
+        edges = np.linspace(log10M_min, log10M_max, n_bins + 1)
+    else:
+        total = float(log10M_max - log10M_min)
+        base = total / float((n_bins - 1) + last_bin_ratio)
+        widths = np.full(n_bins, base, dtype=np.float64)
+        widths[-1] = base * last_bin_ratio
+        edges = log10M_min + np.concatenate([[0.0], np.cumsum(widths)])
+        edges[-1] = float(log10M_max)
     dlog10M = np.diff(edges)
     centers = 0.5 * (edges[:-1] + edges[1:])
     return edges, centers, dlog10M
@@ -363,21 +381,106 @@ def overdensity_pdf_weights(
     return pdf_delta
 
 
-def _choose_centers_stratified(delta: np.ndarray, n: int, seed: int) -> np.ndarray:
-    delta = np.asarray(delta, dtype=np.float64)
+def _choose_centers_stratified(delta: np.ndarray, n: int, seed: int, n_bins: int = 10) -> np.ndarray:
+    """
+    Choose `n` indices stratified in log-overdensity space.
+
+    Stratification is performed in x = log10(1 + delta) using equal-width bins in x.
+    We then draw (approximately) equal numbers of samples from each bin.
+
+    This intentionally over-represents the tails of the parent p(delta) compared to
+    simple random sampling, and is useful when training conditional models that need
+    coverage across the full overdensity range.
+    """
+    delta = np.asarray(delta, dtype=np.float64).ravel()
     n = int(n)
     if n <= 0 or n > delta.size:
         raise ValueError(f"n={n} invalid for delta.size={delta.size}")
-    order = np.argsort(delta)
-    rng = np.random.default_rng(int(seed))
-    edges = np.linspace(0, delta.size, n + 1, dtype=np.int64)
-    idx = []
-    for a, b in zip(edges[:-1], edges[1:]):
-        j = int(rng.integers(int(a), max(int(a) + 1, int(b))))
-        idx.append(int(order[j]))
-    return np.asarray(idx, dtype=np.int64)
 
-def _choose_centers_stratified_excluding(delta: np.ndarray, n: int, seed: int, exclude_idx: np.ndarray) -> np.ndarray:
+    n_bins = int(n_bins)
+    if n_bins <= 0:
+        raise ValueError(f"n_bins must be > 0 (got {n_bins})")
+    n_bins = min(n_bins, n)
+
+    clip_min = -1.0 + 1e-12
+    finite = np.isfinite(delta)
+    valid = finite & (delta > float(clip_min))
+    if not np.any(valid):
+        raise ValueError("No valid delta samples for stratified selection.")
+
+    x = np.full(delta.shape, np.nan, dtype=np.float64)
+    x[valid] = np.log10(1.0 + np.clip(delta[valid], float(clip_min), None))
+    xmin = float(np.nanmin(x))
+    xmax = float(np.nanmax(x))
+    if not np.isfinite(xmin) or not np.isfinite(xmax) or not (xmax > xmin):
+        rng = np.random.default_rng(int(seed))
+        return rng.choice(np.arange(delta.size, dtype=np.int64), size=n, replace=False)
+
+    edges = np.linspace(xmin, xmax, n_bins + 1, dtype=np.float64)
+
+    # Candidate indices per bin.
+    cand_bins: list[np.ndarray] = []
+    for i in range(n_bins):
+        lo = edges[i]
+        hi = edges[i + 1]
+        if i == n_bins - 1:
+            m = valid & (x >= lo) & (x <= hi)
+        else:
+            m = valid & (x >= lo) & (x < hi)
+        cand_bins.append(np.nonzero(m)[0].astype(np.int64))
+
+    rng = np.random.default_rng(int(seed))
+
+    # Target counts per bin (as equal as possible).
+    base = n // n_bins
+    rem = n - base * n_bins
+    targets = np.full(n_bins, base, dtype=np.int64)
+    if rem > 0:
+        # Distribute remainder across bins uniformly.
+        extra_bins = rng.choice(np.arange(n_bins, dtype=np.int64), size=rem, replace=False)
+        targets[extra_bins] += 1
+
+    chosen: list[int] = []
+    used = np.zeros(delta.size, dtype=bool)
+    deficits = 0
+    for i in range(n_bins):
+        need = int(targets[i])
+        if need <= 0:
+            continue
+        cand = cand_bins[i]
+        if cand.size == 0:
+            deficits += need
+            continue
+        k = min(need, int(cand.size))
+        pick = rng.choice(cand, size=k, replace=False)
+        for ii in np.asarray(pick, dtype=np.int64).tolist():
+            used[int(ii)] = True
+            chosen.append(int(ii))
+        deficits += max(0, need - k)
+
+    # Fill any deficits from the remaining pool (still uniform in x-bins as much as possible).
+    if deficits > 0:
+        remaining = np.nonzero(valid & (~used))[0].astype(np.int64)
+        if remaining.size < deficits:
+            raise RuntimeError(f"Stratified selection underfilled: need {deficits}, have {remaining.size} remaining.")
+        fill = rng.choice(remaining, size=int(deficits), replace=False)
+        chosen.extend([int(ii) for ii in np.asarray(fill, dtype=np.int64).tolist()])
+
+    chosen = np.asarray(chosen, dtype=np.int64)
+    if chosen.size != n:
+        # As a last resort, enforce exact size via random trimming/fill (should be rare).
+        if chosen.size > n:
+            chosen = rng.choice(chosen, size=n, replace=False)
+        else:
+            remaining = np.nonzero(valid & (~used))[0].astype(np.int64)
+            fill = rng.choice(remaining, size=(n - chosen.size), replace=False)
+            chosen = np.concatenate([chosen, fill], axis=0)
+
+    return np.asarray(chosen, dtype=np.int64)
+
+def _choose_centers_stratified_excluding(
+    delta: np.ndarray, n: int, seed: int, exclude_idx: np.ndarray, n_bins: int = 10
+) -> np.ndarray:
     """
     Choose `n` indices stratified in `delta`, excluding any indices in `exclude_idx`.
 
@@ -387,7 +490,7 @@ def _choose_centers_stratified_excluding(delta: np.ndarray, n: int, seed: int, e
     n = int(n)
     exclude_idx = np.asarray(exclude_idx, dtype=np.int64).ravel()
     if exclude_idx.size == 0:
-        return _choose_centers_stratified(delta, n, seed)
+        return _choose_centers_stratified(delta, n, seed, n_bins=n_bins)
     exclude_idx = np.unique(exclude_idx)
     if np.any(exclude_idx < 0) or np.any(exclude_idx >= delta.size):
         raise ValueError("exclude_idx contains out-of-range indices")
@@ -396,7 +499,7 @@ def _choose_centers_stratified_excluding(delta: np.ndarray, n: int, seed: int, e
     avail = np.nonzero(mask)[0].astype(np.int64)
     if n <= 0 or n > avail.size:
         raise ValueError(f"n={n} invalid for available.size={avail.size}")
-    sub = _choose_centers_stratified(delta[avail], n, seed)
+    sub = _choose_centers_stratified(delta[avail], n, seed, n_bins=n_bins)
     return avail[np.asarray(sub, dtype=np.int64)]
 
 
@@ -406,16 +509,17 @@ def _choose_centers_stratified_2d(
     n: int,
     seed: int,
     *,
+    n_bins: int = 10,
     clip_min: float = -1.0 + 1e-12,
-    max_rounds: int = 8,
 ) -> np.ndarray:
     """
-    Choose `n` indices stratified in 2D overdensity space.
+    Choose `n` indices stratified in 2D log-overdensity space.
 
-    Uses a simple Latin-hypercube strategy in x=log10(1+delta) per dimension:
-      1) sample targets in quantile space,
-      2) map to x1,x2 targets via marginal quantiles,
-      3) pick nearest grid points in (x1,x2), enforcing uniqueness.
+    Stratification is performed in:
+        x1 = log10(1 + delta1),  x2 = log10(1 + delta2),
+    using an equal-width (n_bins x n_bins) grid in (x1,x2). We then draw approximately
+    equal numbers of samples from each non-empty cell, with any deficits filled from
+    the remaining valid pool.
     """
     delta1 = np.asarray(delta1, dtype=np.float64).ravel()
     delta2 = np.asarray(delta2, dtype=np.float64).ravel()
@@ -425,47 +529,100 @@ def _choose_centers_stratified_2d(
     if n <= 0 or n > delta1.size:
         raise ValueError(f"n={n} invalid for delta.size={delta1.size}")
 
-    d1 = np.clip(delta1, float(clip_min), None)
-    d2 = np.clip(delta2, float(clip_min), None)
+    rng = np.random.default_rng(int(seed))
+    n_bins = int(n_bins)
+    if n_bins <= 0:
+        raise ValueError(f"n_bins must be > 0 (got {n_bins})")
+    n_bins = min(n_bins, n)
+
+    clip_min = float(clip_min)
+    m = (
+        np.isfinite(delta1)
+        & np.isfinite(delta2)
+        & (delta1 > clip_min)
+        & (delta2 > clip_min)
+    )
+    if not np.any(m):
+        raise ValueError("No valid delta samples for 2D stratified selection.")
+
+    d1 = np.clip(delta1[m], clip_min, None)
+    d2 = np.clip(delta2[m], clip_min, None)
     x1 = np.log10(1.0 + d1)
     x2 = np.log10(1.0 + d2)
     if not (np.all(np.isfinite(x1)) and np.all(np.isfinite(x2))):
         raise ValueError("Non-finite log10(1+delta) encountered; check clip_min and gridder field.")
 
-    from scipy.spatial import cKDTree
-    from scipy.stats import qmc
+    xmin1, xmax1 = float(np.min(x1)), float(np.max(x1))
+    xmin2, xmax2 = float(np.min(x2)), float(np.max(x2))
+    if not (xmax1 > xmin1) or not (xmax2 > xmin2):
+        # Degenerate range: fall back to random selection from valid points.
+        valid_idx = np.nonzero(m)[0].astype(np.int64)
+        return rng.choice(valid_idx, size=n, replace=False)
 
-    pts = np.stack([x1, x2], axis=1)
-    tree = cKDTree(pts)
+    e1 = np.linspace(xmin1, xmax1, n_bins + 1, dtype=np.float64)
+    e2 = np.linspace(xmin2, xmax2, n_bins + 1, dtype=np.float64)
 
-    out: list[int] = []
-    used: set[int] = set()
-    rng = np.random.default_rng(int(seed))
+    valid_idx = np.nonzero(m)[0].astype(np.int64)
+    b1 = np.searchsorted(e1, x1, side="right") - 1
+    b2 = np.searchsorted(e2, x2, side="right") - 1
+    b1 = np.clip(b1, 0, n_bins - 1)
+    b2 = np.clip(b2, 0, n_bins - 1)
+    cell = (b1 * n_bins + b2).astype(np.int64)
 
-    # Over-sample targets each round to compensate for duplicates in nearest-neighbour mapping.
-    for r in range(int(max_rounds)):
-        need = n - len(out)
+    # Collect candidates per cell.
+    cells: dict[int, np.ndarray] = {}
+    for c in range(n_bins * n_bins):
+        ids = valid_idx[cell == c]
+        if ids.size:
+            cells[int(c)] = ids
+    if not cells:
+        return rng.choice(valid_idx, size=n, replace=False)
+
+    cell_keys = np.array(sorted(cells.keys()), dtype=np.int64)
+    n_cells = int(cell_keys.size)
+
+    base = n // n_cells
+    rem = n - base * n_cells
+    targets = np.full(n_cells, base, dtype=np.int64)
+    if rem > 0:
+        extra = rng.choice(np.arange(n_cells, dtype=np.int64), size=rem, replace=False)
+        targets[extra] += 1
+
+    chosen: list[int] = []
+    used = np.zeros(delta1.size, dtype=bool)
+    deficits = 0
+    for k, c in enumerate(cell_keys.tolist()):
+        need = int(targets[k])
         if need <= 0:
-            break
-        m = int(max(need * 4, 64))
-        sampler = qmc.LatinHypercube(d=2, seed=int(seed) + r)
-        u = sampler.random(n=m)  # in [0,1)^2
-        t1 = np.quantile(x1, u[:, 0])
-        t2 = np.quantile(x2, u[:, 1])
-        targets = np.stack([t1, t2], axis=1)
-        _, nn = tree.query(targets, k=1, workers=-1)
-        cand = np.asarray(nn, dtype=np.int64)
-        cand = rng.permutation(cand)
-        for ii in cand.tolist():
-            if ii in used:
-                continue
-            used.add(int(ii))
-            out.append(int(ii))
-            if len(out) == n:
-                break
-    if len(out) != n:
-        raise RuntimeError(f"2D stratified selection underfilled (got {len(out)}, expected {n}).")
-    return np.asarray(out, dtype=np.int64)
+            continue
+        cand = np.asarray(cells[int(c)], dtype=np.int64)
+        if cand.size == 0:
+            deficits += need
+            continue
+        take = min(need, int(cand.size))
+        pick = rng.choice(cand, size=take, replace=False)
+        for ii in np.asarray(pick, dtype=np.int64).tolist():
+            used[int(ii)] = True
+            chosen.append(int(ii))
+        deficits += max(0, need - take)
+
+    if deficits > 0:
+        remaining = np.nonzero(m & (~used))[0].astype(np.int64)
+        if remaining.size < deficits:
+            raise RuntimeError(f"2D stratified selection underfilled: need {deficits}, have {remaining.size}.")
+        fill = rng.choice(remaining, size=deficits, replace=False)
+        chosen.extend([int(ii) for ii in np.asarray(fill, dtype=np.int64).tolist()])
+
+    chosen = np.asarray(chosen, dtype=np.int64)
+    if chosen.size != n:
+        if chosen.size > n:
+            chosen = rng.choice(chosen, size=n, replace=False)
+        else:
+            remaining = np.nonzero(m & (~used))[0].astype(np.int64)
+            fill = rng.choice(remaining, size=(n - chosen.size), replace=False)
+            chosen = np.concatenate([chosen, fill], axis=0)
+
+    return np.asarray(chosen, dtype=np.int64)
 
 
 def _choose_centers_stratified_2d_excluding(
@@ -475,6 +632,7 @@ def _choose_centers_stratified_2d_excluding(
     seed: int,
     exclude_idx: np.ndarray,
     *,
+    n_bins: int = 10,
     clip_min: float = -1.0 + 1e-12,
 ) -> np.ndarray:
     """
@@ -482,7 +640,7 @@ def _choose_centers_stratified_2d_excluding(
     """
     exclude_idx = np.asarray(exclude_idx, dtype=np.int64).ravel()
     if exclude_idx.size == 0:
-        return _choose_centers_stratified_2d(delta1, delta2, n, seed, clip_min=clip_min)
+        return _choose_centers_stratified_2d(delta1, delta2, n, seed, n_bins=int(n_bins), clip_min=clip_min)
     exclude_idx = np.unique(exclude_idx)
     if np.any(exclude_idx < 0):
         raise ValueError("exclude_idx contains negative indices")
@@ -497,7 +655,7 @@ def _choose_centers_stratified_2d_excluding(
     avail = np.nonzero(mask)[0].astype(np.int64)
     if int(n) > avail.size:
         raise ValueError(f"n={n} invalid for available.size={avail.size}")
-    sub = _choose_centers_stratified_2d(delta1[avail], delta2[avail], n, seed, clip_min=clip_min)
+    sub = _choose_centers_stratified_2d(delta1[avail], delta2[avail], n, seed, n_bins=int(n_bins), clip_min=clip_min)
     return avail[np.asarray(sub, dtype=np.int64)]
 
 
@@ -509,9 +667,9 @@ def _select_nonoverlapping_centers_stratified_2d(
     boxsize: float,
     kernel_radius: float,
     n_select: int,
+    n_bins: int = 10,
     seed: int,
-    max_rounds: int = 32,
-    k_nearest: int = 64,
+    max_attempts: int = 32,
     avoid_pos: list[np.ndarray] | None = None,
     exclude_idx: np.ndarray | None = None,
     clip_min: float = -1.0 + 1e-12,
@@ -519,8 +677,10 @@ def _select_nonoverlapping_centers_stratified_2d(
     """
     2D-stratified selection with a non-overlap constraint (periodic; min sep = 2R).
 
-    Strategy: generate LHS targets in (x1,x2)=log10(1+delta), then for each target pick one of the
-    k-nearest grid points that does not overlap with already-chosen centres.
+    Stratification is performed on an equal-width (n_bins x n_bins) grid in
+    (x1,x2)=log10(1+delta), drawing approximately equal numbers per non-empty cell.
+    Any unfilled draws (empty cells or overlap failures) are treated as deficits and
+    filled from the remaining valid pool while still enforcing non-overlap.
     """
     grid_pos = np.asarray(grid_pos, dtype=np.float64)
     delta1 = np.asarray(delta1, dtype=np.float64).ravel()
@@ -536,46 +696,89 @@ def _select_nonoverlapping_centers_stratified_2d(
     min_sep2 = (2.0 * R) ** 2
     pos = np.mod(grid_pos, L)
 
-    avoid_pos = [] if avoid_pos is None else list(avoid_pos)
-    used: set[int] = set()
-    if exclude_idx is not None:
-        for ii in np.asarray(exclude_idx, dtype=np.int64).ravel().tolist():
-            used.add(int(ii))
-
-    d1 = np.clip(delta1, float(clip_min), None)
-    d2 = np.clip(delta2, float(clip_min), None)
-    x1 = np.log10(1.0 + d1)
-    x2 = np.log10(1.0 + d2)
-    pts = np.stack([x1, x2], axis=1)
-
-    from scipy.spatial import cKDTree
-    from scipy.stats import qmc
-
-    tree = cKDTree(pts)
     rng = np.random.default_rng(int(seed))
 
-    keep: list[int] = []
-    keep_pos: list[np.ndarray] = list(avoid_pos)
+    n_bins = int(n_bins)
+    if n_bins <= 0:
+        raise ValueError(f"n_bins must be > 0 (got {n_bins})")
+    n_bins = min(n_bins, n_select)
 
-    for r in range(int(max_rounds)):
-        if len(keep) == n_select:
-            break
-        need = n_select - len(keep)
-        sampler = qmc.LatinHypercube(d=2, seed=int(seed) + r)
-        u = sampler.random(n=max(need * 4, 64))
-        t1 = np.quantile(x1, u[:, 0])
-        t2 = np.quantile(x2, u[:, 1])
-        targets = np.stack([t1, t2], axis=1)
-        _, nn = tree.query(targets, k=int(k_nearest), workers=-1)
-        nn = np.atleast_2d(nn)
-        order = rng.permutation(nn.shape[0])
-        for i in order.tolist():
-            if len(keep) == n_select:
-                break
-            row = nn[int(i)]
+    clip_min = float(clip_min)
+    valid = (
+        np.isfinite(delta1)
+        & np.isfinite(delta2)
+        & (delta1 > clip_min)
+        & (delta2 > clip_min)
+    )
+    if not np.any(valid):
+        raise ValueError("No valid delta samples for 2D non-overlap selection.")
+
+    x1 = np.full(delta1.shape, np.nan, dtype=np.float64)
+    x2 = np.full(delta2.shape, np.nan, dtype=np.float64)
+    x1[valid] = np.log10(1.0 + np.clip(delta1[valid], clip_min, None))
+    x2[valid] = np.log10(1.0 + np.clip(delta2[valid], clip_min, None))
+    xmin1, xmax1 = float(np.nanmin(x1)), float(np.nanmax(x1))
+    xmin2, xmax2 = float(np.nanmin(x2)), float(np.nanmax(x2))
+    if not (xmax1 > xmin1) or not (xmax2 > xmin2):
+        raise ValueError("Degenerate log10(1+delta) range; cannot stratify.")
+
+    e1 = np.linspace(xmin1, xmax1, n_bins + 1, dtype=np.float64)
+    e2 = np.linspace(xmin2, xmax2, n_bins + 1, dtype=np.float64)
+    b1 = np.searchsorted(e1, x1, side="right") - 1
+    b2 = np.searchsorted(e2, x2, side="right") - 1
+    b1 = np.clip(b1, 0, n_bins - 1)
+    b2 = np.clip(b2, 0, n_bins - 1)
+    cell = (b1 * n_bins + b2).astype(np.int64)
+
+    # Precompute per-cell candidate indices (valid only).
+    strata: list[np.ndarray] = []
+    for c in range(n_bins * n_bins):
+        ids = np.nonzero(valid & (cell == c))[0].astype(np.int64)
+        strata.append(ids)
+    nonempty = [i for i, ids in enumerate(strata) if ids.size > 0]
+    if not nonempty:
+        raise ValueError("All 2D log-overdensity bins are empty; cannot stratify.")
+
+    avoid_pos = [] if avoid_pos is None else list(avoid_pos)
+    exclude_set: set[int] = set()
+    if exclude_idx is not None:
+        for ii in np.asarray(exclude_idx, dtype=np.int64).ravel().tolist():
+            exclude_set.add(int(ii))
+
+    for attempt in range(int(max_attempts)):
+        rng = np.random.default_rng(int(seed) + attempt)
+        keep: list[int] = []
+        keep_pos: list[np.ndarray] = list(avoid_pos)
+        used: set[int] = set(exclude_set)
+
+        n_cells = int(len(nonempty))
+        base = n_select // n_cells
+        rem = n_select - base * n_cells
+        targets = np.full(n_cells, base, dtype=np.int64)
+        if rem > 0:
+            extra = rng.choice(np.arange(n_cells, dtype=np.int64), size=rem, replace=False)
+            targets[extra] += 1
+
+        draws: list[int] = []
+        for k, c in enumerate(nonempty):
+            draws.extend([int(c)] * int(targets[k]))
+        rng.shuffle(draws)
+
+        # Per-cell shuffled candidate lists (excluding already-used).
+        cell_lists: dict[int, list[int]] = {}
+        for c in nonempty:
+            ids = strata[int(c)]
+            ids = ids[~np.isin(ids, np.fromiter(used, dtype=np.int64, count=len(used)))] if used else ids
+            if ids.size:
+                cell_lists[int(c)] = rng.permutation(ids).astype(np.int64).tolist()
+            else:
+                cell_lists[int(c)] = []
+
+        for c in draws:
+            cand = cell_lists.get(int(c), [])
             chosen = None
-            for ii in row.tolist():
-                ii = int(ii)
+            while cand:
+                ii = int(cand.pop())
                 if ii in used:
                     continue
                 p = pos[ii]
@@ -587,13 +790,30 @@ def _select_nonoverlapping_centers_stratified_2d(
             keep.append(int(chosen))
             keep_pos.append(pos[int(chosen)])
             used.add(int(chosen))
+            if len(keep) == n_select:
+                break
 
-    if len(keep) != n_select:
-        raise RuntimeError(
-            f"Could not select {n_select} non-overlapping spheres (2D stratified; R={R:g}, min center sep={2*R:g}). "
-            "Try reducing --n-spheres, reducing --kernel-radius, or enabling overlaps."
-        )
-    return np.asarray(keep, dtype=np.int64)
+        if len(keep) < n_select:
+            remaining = np.nonzero(valid)[0].astype(np.int64)
+            if used:
+                remaining = remaining[~np.isin(remaining, np.fromiter(used, dtype=np.int64, count=len(used)))]
+            remaining = rng.permutation(remaining)
+            for ii in remaining.tolist():
+                if len(keep) >= n_select:
+                    break
+                p = pos[int(ii)]
+                if _periodic_ok(p, keep_pos, L, min_sep2):
+                    keep.append(int(ii))
+                    keep_pos.append(p)
+                    used.add(int(ii))
+
+        if len(keep) == n_select:
+            return np.asarray(keep, dtype=np.int64)
+
+    raise RuntimeError(
+        f"Could not select {n_select} non-overlapping spheres (2D log-stratified; R={R:g}, min center sep={2*R:g}). "
+        "Try reducing --n-spheres, reducing --kernel-radius, reducing --n-delta-bins, or enabling overlaps."
+    )
 
 
 def _periodic_ok(p: np.ndarray, keep_pos: list[np.ndarray], boxsize: float, min_sep2: float) -> bool:
@@ -624,6 +844,7 @@ def _select_nonoverlapping_centers_stratified(
     boxsize: float,
     kernel_radius: float,
     n_select: int,
+    n_bins: int = 10,
     seed: int,
     max_attempts: int = 32,
     avoid_pos: list[np.ndarray] | None = None,
@@ -646,6 +867,11 @@ def _select_nonoverlapping_centers_stratified(
     if grid_pos.shape[0] != delta.shape[0]:
         raise ValueError("grid_pos and delta must have the same length")
 
+    n_bins = int(n_bins)
+    if n_bins <= 0:
+        raise ValueError(f"n_bins must be > 0 (got {n_bins})")
+    n_bins = min(n_bins, n_select)
+
     min_sep2 = (2.0 * R) ** 2
     pos = np.mod(grid_pos, L)
 
@@ -655,11 +881,31 @@ def _select_nonoverlapping_centers_stratified(
         for ii in np.asarray(exclude_idx, dtype=np.int64).ravel().tolist():
             exclude_set.add(int(ii))
 
-    order = np.argsort(delta)  # ascending δ
-    edges = np.linspace(0, delta.size, n_select + 1, dtype=np.int64)
-    strata = [order[int(a) : int(b)] for a, b in zip(edges[:-1], edges[1:])]
-    if any(s.size == 0 for s in strata):
-        raise RuntimeError("Internal error: empty stratum encountered.")
+    clip_min = -1.0 + 1e-12
+    finite = np.isfinite(delta)
+    valid = finite & (delta > float(clip_min))
+    if not np.any(valid):
+        raise ValueError("No valid delta samples for stratified non-overlap selection.")
+
+    x = np.full(delta.shape, np.nan, dtype=np.float64)
+    x[valid] = np.log10(1.0 + np.clip(delta[valid], float(clip_min), None))
+    xmin = float(np.nanmin(x))
+    xmax = float(np.nanmax(x))
+    if not np.isfinite(xmin) or not np.isfinite(xmax) or not (xmax > xmin):
+        raise ValueError("Degenerate log10(1+delta) range; cannot stratify.")
+
+    x_edges = np.linspace(xmin, xmax, n_bins + 1, dtype=np.float64)
+    strata: list[np.ndarray] = []
+    for i in range(n_bins):
+        lo = x_edges[i]
+        hi = x_edges[i + 1]
+        if i == n_bins - 1:
+            m = valid & (x >= lo) & (x <= hi)
+        else:
+            m = valid & (x >= lo) & (x < hi)
+        strata.append(np.nonzero(m)[0].astype(np.int64))
+    if not any(s.size > 0 for s in strata):
+        raise ValueError("All log-overdensity bins are empty; cannot stratify.")
 
     for attempt in range(int(max_attempts)):
         rng = np.random.default_rng(int(seed) + attempt)
@@ -667,11 +913,28 @@ def _select_nonoverlapping_centers_stratified(
         keep_pos: list[np.ndarray] = list(avoid_pos)
         used: set[int] = set(exclude_set)
 
-        bins = list(range(n_select))
+        base = n_select // n_bins
+        rem = n_select - base * n_bins
+        targets = np.full(n_bins, base, dtype=np.int64)
+        if rem > 0:
+            extra_bins = rng.choice(np.arange(n_bins, dtype=np.int64), size=rem, replace=False)
+            targets[extra_bins] += 1
+
+        # Expand into a sequence of bin assignments, then randomize bin order.
+        bins: list[int] = []
+        for b in range(n_bins):
+            bins.extend([int(b)] * int(targets[b]))
         rng.shuffle(bins)
-        success = True
+        # We try to place a center for each requested bin draw; if a particular draw
+        # can't find a non-overlapping candidate in that bin, treat it as a deficit
+        # and fill from the remaining pool later (still enforcing non-overlap).
+        deficits = 0
         for b in bins:
             cand = np.asarray(strata[int(b)], dtype=np.int64)
+            if cand.size == 0:
+                # Bin is empty; we'll fill later from any remaining valid points.
+                deficits += 1
+                continue
             cand = rng.permutation(cand)
 
             chosen = None
@@ -683,13 +946,28 @@ def _select_nonoverlapping_centers_stratified(
                     chosen = int(ii)
                     break
             if chosen is None:
-                success = False
-                break
-            keep.append(chosen)
-            keep_pos.append(pos[chosen])
-            used.add(chosen)
+                deficits += 1
+                continue
+            keep.append(int(chosen))
+            keep_pos.append(pos[int(chosen)])
+            used.add(int(chosen))
 
-        if success and len(keep) == n_select:
+        if deficits > 0 or len(keep) < n_select:
+            # Fill any missing slots from the remaining valid points, respecting non-overlap.
+            remaining = np.nonzero(valid)[0].astype(np.int64)
+            if used:
+                remaining = remaining[~np.isin(remaining, np.fromiter(used, dtype=np.int64, count=len(used)))]
+            remaining = rng.permutation(remaining)
+            for ii in remaining.tolist():
+                if len(keep) >= n_select:
+                    break
+                p = pos[int(ii)]
+                if _periodic_ok(p, keep_pos, L, min_sep2):
+                    keep.append(int(ii))
+                    keep_pos.append(p)
+                    used.add(int(ii))
+
+        if len(keep) == n_select:
             return np.asarray(keep, dtype=np.int64)
 
     raise RuntimeError(
@@ -720,12 +998,15 @@ def build_parent_dataset(
     kernel_radius_1: float | None = None,
     kernel_radius_2: float | None = None,
     n_spheres: int = 512,
+    n_delta_bins: int = 10,
     seed: int = 0,
     n_mass_bins: int = 25,
+    last_bin_ratio: float = 1.2,
     log10M_min: float | None = None,
     log10M_max: float | None = None,
     n_delta_q: int = 2048,
     baseline: str = "box",
+    baseline_weight: str = "uniform",
     baseline_pseudocount: float = 0.5,
     include_top_overdense: int = 0,
     include_top_halos: int = 0,
@@ -733,46 +1014,50 @@ def build_parent_dataset(
 ) -> ParentDataset:
     centres_h, masses_h, boxsize, _z = read_swift_fof(parent_fof)
 
-    # Determine the two overdensity smoothing radii (R1 < R2) and the sphere counting radius (kernel_radius).
+    # Determine the two overdensity smoothing radii (R1 < R2) and the sphere counting radius.
     radii = list_gridder_kernel_radii(gridder_file)
     if len(radii) < 2:
         raise ValueError(f"{gridder_file}: need at least two kernels (have {radii})")
 
-    if kernel_radius_2 is None and kernel_radius is not None:
-        kernel_radius_2 = float(kernel_radius)
-    if kernel_radius_1 is None and kernel_radius_2 is None:
-        r1, r2 = float(radii[0]), float(radii[1])
+    # Sphere radius: by default try 20 Mpc if available, else fall back to the second-smallest kernel.
+    if kernel_radius is None:
+        sphere_radius = 20.0 if any(np.isclose(rr, 20.0, rtol=0, atol=1e-8) for rr in radii) else float(radii[1])
     else:
-        if kernel_radius_2 is None:
-            raise ValueError("Provide --kernel-radius (or kernel_radius_2) when setting kernel_radius_1 explicitly.")
+        sphere_radius = float(kernel_radius)
+
+    # Overdensity radii: default to using the sphere radius as the "small" scale, plus the next-larger kernel.
+    r1 = float(kernel_radius_1) if kernel_radius_1 is not None else float(sphere_radius)
+    if kernel_radius_2 is None:
+        larger = [rr for rr in radii if rr > r1 + 1e-8]
+        if not larger:
+            raise ValueError(f"{gridder_file}: cannot infer a larger kernel_radius_2 > {r1:g} from available {radii}")
+        r2 = float(larger[0])
+    else:
         r2 = float(kernel_radius_2)
-        if kernel_radius_1 is None:
-            # Choose the smallest available radius that isn't r2.
-            others = [rr for rr in radii if not np.isclose(rr, r2, rtol=0, atol=1e-8)]
-            if not others:
-                raise ValueError(f"{gridder_file}: cannot infer kernel_radius_1 distinct from kernel_radius_2={r2:g}")
-            r1 = float(others[0])
-        else:
-            r1 = float(kernel_radius_1)
     if r2 < r1:
         r1, r2 = r2, r1
-
-    if kernel_radius is None:
-        kernel_radius = float(r2)
-    kernel_radius = float(kernel_radius)
+    if np.isclose(r1, r2, rtol=0, atol=1e-8):
+        raise ValueError(f"kernel_radius_1 and kernel_radius_2 must be distinct (got {r1:g})")
 
     grid_pos, grid_delta1, grid_delta2 = load_gridder_overdensity_pair(
         gridder_file, kernel_radius_1=float(r1), kernel_radius_2=float(r2)
     )
 
     log10M_edges, log10M_centers, dlog10M = log10_mass_bins(
-        masses_h, n_bins=int(n_mass_bins), log10M_min=log10M_min, log10M_max=log10M_max
+        masses_h,
+        n_bins=int(n_mass_bins),
+        log10M_min=log10M_min,
+        log10M_max=log10M_max,
+        last_bin_ratio=float(last_bin_ratio),
     )
     log_n_box = np.log(hmf_dn_dlog10M(masses_h, boxsize**3, log10M_edges) + 1e-300)
 
     baseline = str(baseline).lower().strip()
-    if baseline not in {"box", "spheres"}:
-        raise ValueError(f"baseline must be 'box' or 'spheres' (got {baseline!r})")
+    if baseline not in {"box", "spheres", "hybrid"}:
+        raise ValueError(f"baseline must be 'box', 'spheres', or 'hybrid' (got {baseline!r})")
+    baseline_weight = str(baseline_weight).lower().strip()
+    if baseline_weight not in {"uniform", "pdf"}:
+        raise ValueError(f"baseline_weight must be 'uniform' or 'pdf' (got {baseline_weight!r})")
     log_n_base: np.ndarray | None = None
     if baseline == "box":
         log_n_base = log_n_box
@@ -820,7 +1105,9 @@ def build_parent_dataset(
     if bool(allow_overlap):
         n_rem = int(n_spheres) - int(forced_idx.size)
         strat_idx = (
-            _choose_centers_stratified_2d_excluding(grid_delta1, grid_delta2, n_rem, int(seed), forced_idx)
+            _choose_centers_stratified_2d_excluding(
+                grid_delta1, grid_delta2, n_rem, int(seed), forced_idx, n_bins=int(n_delta_bins)
+            )
             if n_rem > 0
             else np.zeros(0, dtype=np.int64)
         )
@@ -832,7 +1119,7 @@ def build_parent_dataset(
         #  1) force include "halo-selected" and/or top-overdense centres (without overlap),
         #  2) fill remaining slots with a δ-stratified non-overlapping sample excluding forced centres.
         L = float(boxsize)
-        R = float(kernel_radius)
+        R = float(sphere_radius)
         min_sep2 = (2.0 * R) ** 2
         pos = np.mod(np.asarray(grid_pos, dtype=np.float64), L)
 
@@ -852,8 +1139,9 @@ def build_parent_dataset(
                 delta1=grid_delta1,
                 delta2=grid_delta2,
                 boxsize=float(boxsize),
-                kernel_radius=float(kernel_radius),
+                kernel_radius=float(sphere_radius),
                 n_select=n_rem,
+                n_bins=int(n_delta_bins),
                 seed=int(seed),
                 avoid_pos=keep_forced_pos,
                 exclude_idx=forced_keep_idx,
@@ -872,7 +1160,7 @@ def build_parent_dataset(
     L = float(boxsize)
     halo_pos = np.mod(np.asarray(centres_h, dtype=np.float64), L)
     tree = cKDTree(halo_pos, boxsize=L)
-    hits = tree.query_ball_point(np.mod(centers, L), r=float(kernel_radius), workers=-1)
+    hits = tree.query_ball_point(np.mod(centers, L), r=float(sphere_radius), workers=-1)
 
     J = log10M_centers.size
     N = np.zeros((int(n_spheres), J), dtype=np.int32)
@@ -882,14 +1170,23 @@ def build_parent_dataset(
             continue
         N[s], _ = np.histogram(log10M[np.asarray(ids, dtype=np.int64)], bins=log10M_edges)
 
-    V = np.full(int(n_spheres), float(4.0 / 3.0 * np.pi * kernel_radius**3), dtype=np.float64)
+    V = np.full(int(n_spheres), float(4.0 / 3.0 * np.pi * sphere_radius**3), dtype=np.float64)
 
     if log_n_base is None:
-        w_base = overdensity_pdf_weights(delta_spheres=delta, delta_parent=np.stack([grid_delta1, grid_delta2], axis=1))
+        w_base = None
+        if baseline_weight == "pdf":
+            # Approximate p(delta) weighting using the marginal distribution of the second
+            # (typically larger-scale) overdensity component.
+            w_base = overdensity_pdf_weights(delta_spheres=np.asarray(delta)[:, 1], delta_parent=grid_delta2)
         n_base = baseline_from_spheres(
             N, V, dlog10M, pseudocount=float(baseline_pseudocount), sphere_weights=w_base
         )
         log_n_base = np.log(np.asarray(n_base, dtype=np.float64) + 1e-300)
+        if baseline == "hybrid":
+            # Anchor the highest-mass bin to the unconditional parent-box HMF, but learn delta-dependent
+            # deviations from the spheres. This uses full-box information only for the tail normalization.
+            if log_n_base.size > 0:
+                log_n_base[-1] = log_n_box[-1]
 
     rng = np.random.default_rng(int(seed) + 1)
     if int(n_delta_q) <= 0:
@@ -1166,6 +1463,7 @@ def save_emulator(
     delta_train: np.ndarray,
     train_center_idx: np.ndarray | None,
     train_gridder_file: Path | None,
+    baseline_mode: str | None = None,
     beta_tail: float | None = None,
     tail_top_bins: int | None = None,
     tail_eps: float | None = None,
@@ -1188,6 +1486,8 @@ def save_emulator(
                 f.attrs["kernel_radii"] = np.asarray([float(r1), float(r2)], dtype=np.float64)
             if train_gridder_file is not None:
                 f.attrs["gridder_file"] = str(Path(train_gridder_file))
+            if baseline_mode is not None:
+                f.attrs["baseline_mode"] = str(baseline_mode)
             if beta_tail is not None:
                 f.attrs["beta_tail"] = float(beta_tail)
             if tail_top_bins is not None:
@@ -1233,6 +1533,11 @@ def save_emulator(
                 else {}
             ),
             **(
+                {"baseline_mode": np.asarray(str(baseline_mode), dtype=np.str_)}
+                if baseline_mode is not None
+                else {}
+            ),
+            **(
                 {"kernel_radii": np.asarray([float(kernel_radii[0]), float(kernel_radii[1])], dtype=np.float64)}
                 if kernel_radii is not None
                 else {}
@@ -1263,6 +1568,11 @@ def load_emulator(path: Path) -> dict[str, np.ndarray | float]:
                 if isinstance(gf, bytes):
                     gf = gf.decode("utf-8")
                 out["gridder_file"] = str(gf)
+            if "baseline_mode" in f.attrs:
+                bm = f.attrs["baseline_mode"]
+                if isinstance(bm, bytes):
+                    bm = bm.decode("utf-8")
+                out["baseline_mode"] = str(bm)
             if "beta_tail" in f.attrs:
                 out["beta_tail"] = float(f.attrs["beta_tail"])
             if "tail_top_bins" in f.attrs:
@@ -1297,6 +1607,8 @@ def load_emulator(path: Path) -> dict[str, np.ndarray | float]:
         out["delta_mu"] = np.asarray(out["delta_mu"], dtype=np.float64)
     if "delta_sig" in out:
         out["delta_sig"] = np.asarray(out["delta_sig"], dtype=np.float64)
+    if "baseline_mode" in out:
+        out["baseline_mode"] = str(np.asarray(out["baseline_mode"]).item())
     for k in ["beta_tail", "tail_eps"]:
         if k in out:
             out[k] = float(np.asarray(out[k]).item())
@@ -1533,8 +1845,7 @@ def main():
         "--kernel-radius",
         type=float,
         default=None,
-        help="Sphere radius used to count haloes (Mpc). If provided and --kernel-radius-2 is omitted, this also sets "
-        "the larger overdensity smoothing scale. If omitted, defaults to the larger of the two inferred kernel radii.",
+        help="Sphere radius used to count haloes (Mpc). Default: 20 if present in the gridder file, otherwise the second-smallest KernelRadius.",
     )
     tr.add_argument(
         "--kernel-radius-1",
@@ -1549,6 +1860,12 @@ def main():
         help="Second overdensity kernel radius (Mpc). Default: infer the second-smallest available KernelRadius.",
     )
     tr.add_argument("--n-spheres", type=int, default=512)
+    tr.add_argument(
+        "--n-delta-bins",
+        type=int,
+        default=10,
+        help="Number of equal-width bins in log10(1+delta) used for stratified sphere selection.",
+    )
     tr.add_argument(
         "--include-top-overdense",
         type=int,
@@ -1567,6 +1884,13 @@ def main():
         help="Allow spheres to overlap (default is to enforce non-overlapping spheres).",
     )
     tr.add_argument("--n-mass-bins", type=int, default=25)
+    tr.add_argument(
+        "--last-bin-ratio",
+        type=float,
+        default=1.2,
+        help="Make the final mass bin wider by this factor (while keeping the overall [min,max] range fixed). "
+        "Set to 1 for equal-width bins.",
+    )
     tr.add_argument("--K", type=int, default=6, help="Number of PCA modes (excluding intercept).")
     tr.add_argument("--steps", type=int, default=5000)
     tr.add_argument("--lr", type=float, default=1e-3)
@@ -1594,9 +1918,17 @@ def main():
         "--baseline",
         type=str,
         default="spheres",
-        choices=["box", "spheres"],
-        help="How to set log_n_base. 'box' uses the full-box HMF (requires full-box data); "
-        "'spheres' estimates it from the training spheres (matches the sphere sampling distribution).",
+        choices=["box", "spheres", "hybrid"],
+        help="How to set log_n_base. 'box' uses the full-box HMF; 'spheres' estimates it from the training spheres; "
+        "'hybrid' uses the spheres baseline for all bins except the highest-mass bin, which is anchored to the full box.",
+    )
+    tr.add_argument(
+        "--baseline-weight",
+        type=str,
+        default="uniform",
+        choices=["uniform", "pdf"],
+        help="When --baseline=spheres, how to weight spheres when estimating the baseline. "
+        "'uniform' gives each sphere equal weight; 'pdf' weights each sphere by the global overdensity PDF p(delta).",
     )
     tr.add_argument(
         "--baseline-pseudocount",
@@ -1634,25 +1966,25 @@ def main():
         if len(radii) < 2:
             raise ValueError(f"{args.gridder_file}: need at least two KernelRadius values (have {radii})")
 
-        kr1 = args.kernel_radius_1
-        kr2 = args.kernel_radius_2
-        if kr2 is None and args.kernel_radius is not None:
-            kr2 = float(args.kernel_radius)
-        if kr1 is None and kr2 is None:
-            kr1, kr2 = float(radii[0]), float(radii[1])
+        # Sphere radius (counts) defaults to 20 if available; otherwise second-smallest kernel.
+        if args.kernel_radius is None:
+            sphere_radius = 20.0 if any(np.isclose(rr, 20.0, rtol=0, atol=1e-8) for rr in radii) else float(radii[1])
         else:
-            if kr2 is None:
-                raise ValueError("Provide --kernel-radius (or --kernel-radius-2) when setting --kernel-radius-1.")
-            if kr1 is None:
-                others = [rr for rr in radii if not np.isclose(rr, float(kr2), rtol=0, atol=1e-8)]
-                if not others:
-                    raise ValueError(f"{args.gridder_file}: cannot infer kernel-radius-1 distinct from {float(kr2):g}")
-                kr1 = float(others[0])
+            sphere_radius = float(args.kernel_radius)
 
-        kr1, kr2 = float(kr1), float(kr2)
+        # Condition on overdensity at the sphere scale plus a larger-scale overdensity.
+        kr1 = float(args.kernel_radius_1) if args.kernel_radius_1 is not None else float(sphere_radius)
+        if args.kernel_radius_2 is None:
+            larger = [rr for rr in radii if rr > float(kr1) + 1e-8]
+            if not larger:
+                raise ValueError(f"{args.gridder_file}: cannot infer --kernel-radius-2 > {float(kr1):g} from {radii}")
+            kr2 = float(larger[0])
+        else:
+            kr2 = float(args.kernel_radius_2)
         if kr2 < kr1:
             kr1, kr2 = kr2, kr1
-        sphere_radius = float(args.kernel_radius) if args.kernel_radius is not None else float(kr2)
+        if np.isclose(kr1, kr2, rtol=0, atol=1e-8):
+            raise ValueError(f"--kernel-radius-1 and --kernel-radius-2 must be distinct (got {kr1:g})")
         print(f"kernel_radii {kr1:g} {kr2:g}  sphere_radius {sphere_radius:g}")
 
         ds = build_parent_dataset(
@@ -1662,15 +1994,22 @@ def main():
             kernel_radius_1=float(kr1),
             kernel_radius_2=float(kr2),
             n_spheres=int(args.n_spheres),
+            n_delta_bins=int(args.n_delta_bins),
             include_top_overdense=int(args.include_top_overdense),
             include_top_halos=int(args.include_top_halos),
             allow_overlap=bool(args.allow_overlap),
             seed=int(args.seed),
             n_mass_bins=int(args.n_mass_bins),
+            last_bin_ratio=float(args.last_bin_ratio),
             baseline=str(args.baseline),
+            baseline_weight=str(args.baseline_weight),
             baseline_pseudocount=float(args.baseline_pseudocount),
         )
+        if str(args.baseline).lower().strip() == "hybrid" and ds.log10M_edges.size >= 2:
+            lo, hi = float(ds.log10M_edges[-2]), float(ds.log10M_edges[-1])
+            print(f"baseline_hybrid anchored_last_bin log10M∈[{lo:.6g},{hi:.6g}] to parent box")
         # Diagnostics for training-set mass coverage.
+        print("log10M_edges " + " ".join(f"{float(x):.8g}" for x in np.asarray(ds.log10M_edges, dtype=np.float64).tolist()))
         print("training_counts_per_bin " + " ".join(str(int(x)) for x in np.asarray(ds.N.sum(axis=0)).tolist()))
         _centres_box, masses_box, _boxsize, _z = read_swift_fof(args.parent_fof)
         log10M_all = np.log10(np.clip(np.asarray(masses_box, dtype=np.float64), 1e-300, None)) - np.log10(MASS_PIVOT_MSUN)
@@ -1762,6 +2101,7 @@ def main():
             delta_train=np.asarray(ds.delta, dtype=np.float64),
             train_center_idx=np.asarray(ds.center_idx, dtype=np.int64),
             train_gridder_file=args.gridder_file,
+            baseline_mode=str(args.baseline),
             beta_tail=(float(args.beta_tail) if float(args.beta_tail) > 0.0 else None),
             tail_top_bins=(tail_top_bins if float(args.beta_tail) > 0.0 else None),
             tail_eps=(float(args.tail_eps) if float(args.beta_tail) > 0.0 else None),

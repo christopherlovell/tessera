@@ -144,6 +144,7 @@ def plot_overdensity_distribution_with_fit(
     skew: float,
     kurt_excess: float,
     out: Path,
+    delta_selected: np.ndarray | None = None,
     nbins: int = 120,
     clip_min: float = -1.0 + 1e-12,
 ) -> None:
@@ -165,6 +166,13 @@ def plot_overdensity_distribution_with_fit(
 
     x = np.log10(1.0 + delta[valid])
 
+    x_sel = None
+    if delta_selected is not None:
+        ds = np.asarray(delta_selected, dtype=np.float64).ravel()
+        m = np.isfinite(ds) & (ds > float(clip_min))
+        if np.any(m):
+            x_sel = np.log10(1.0 + ds[m])
+
     xmin, xmax = float(np.min(x)), float(np.max(x))
     xx = np.linspace(xmin, xmax, 600)
     pdf = _edgeworth_pdf_log10_overdensity(xx, mu=float(mu), sigma=float(sigma), skew=float(skew), kurt_excess=float(kurt_excess))
@@ -180,6 +188,16 @@ def plot_overdensity_distribution_with_fit(
     fig, (ax_pdf, ax_cdf) = plt.subplots(1, 2, figsize=(11, 4.5), constrained_layout=True)
     ax_pdf.hist(x, bins=int(nbins), density=True, histtype="stepfilled", alpha=0.25, color="tab:blue")
     ax_pdf.hist(x, bins=int(nbins), density=True, histtype="step", lw=1.5, color="tab:blue", label="Measured")
+    if x_sel is not None:
+        ax_pdf.hist(
+            x_sel,
+            bins=int(nbins),
+            density=True,
+            histtype="step",
+            lw=1.5,
+            color="tab:green",
+            label=f"Selected spheres (S={int(x_sel.size)})",
+        )
     ax_pdf.plot(xx, pdf, color="tab:orange", lw=2.0, label="Edgeworth fit")
     ax_pdf.set_xlabel("log10(1 + overdensity)")
     ax_pdf.set_ylabel("PDF")
@@ -188,6 +206,10 @@ def plot_overdensity_distribution_with_fit(
     xs = np.sort(x)
     ys = (np.arange(xs.size, dtype=np.float64) + 1.0) / float(xs.size)
     ax_cdf.plot(xs, ys, color="tab:blue", lw=1.5, label="Measured")
+    if x_sel is not None:
+        xs2 = np.sort(x_sel)
+        ys2 = (np.arange(xs2.size, dtype=np.float64) + 1.0) / float(xs2.size)
+        ax_cdf.plot(xs2, ys2, color="tab:green", lw=1.5, label="Selected spheres")
     ax_cdf.plot(xx, cdf, color="tab:orange", lw=2.0, label="Edgeworth fit")
     ax_cdf.set_xlabel("log10(1 + overdensity)")
     ax_cdf.set_ylabel("CDF")
@@ -204,6 +226,7 @@ def plot_overdensity_distribution(
     delta: np.ndarray,
     *,
     out: Path,
+    delta_selected: np.ndarray | None = None,
     nbins: int = 120,
     clip_min: float = -1.0 + 1e-12,
 ) -> None:
@@ -223,9 +246,26 @@ def plot_overdensity_distribution(
 
     x = np.log10(1.0 + delta[valid])
 
+    x_sel = None
+    if delta_selected is not None:
+        ds = np.asarray(delta_selected, dtype=np.float64).ravel()
+        m = np.isfinite(ds) & (ds > float(clip_min))
+        if np.any(m):
+            x_sel = np.log10(1.0 + ds[m])
+
     fig, (ax_pdf, ax_cdf) = plt.subplots(1, 2, figsize=(11, 4.5), constrained_layout=True)
     ax_pdf.hist(x, bins=int(nbins), density=True, histtype="stepfilled", alpha=0.25, color="tab:blue")
     ax_pdf.hist(x, bins=int(nbins), density=True, histtype="step", lw=1.5, color="tab:blue", label="Measured")
+    if x_sel is not None:
+        ax_pdf.hist(
+            x_sel,
+            bins=int(nbins),
+            density=True,
+            histtype="step",
+            lw=1.5,
+            color="tab:green",
+            label=f"Selected spheres (S={int(x_sel.size)})",
+        )
     ax_pdf.set_xlabel("log10(1 + overdensity)")
     ax_pdf.set_ylabel("PDF")
     ax_pdf.legend(loc="best", frameon=False)
@@ -233,6 +273,10 @@ def plot_overdensity_distribution(
     xs = np.sort(x)
     ys = (np.arange(xs.size, dtype=np.float64) + 1.0) / float(xs.size)
     ax_cdf.plot(xs, ys, color="tab:blue", lw=1.5, label="Measured")
+    if x_sel is not None:
+        xs2 = np.sort(x_sel)
+        ys2 = (np.arange(xs2.size, dtype=np.float64) + 1.0) / float(xs2.size)
+        ax_cdf.plot(xs2, ys2, color="tab:green", lw=1.5, label="Selected spheres")
     ax_cdf.set_xlabel("log10(1 + overdensity)")
     ax_cdf.set_ylabel("CDF")
     ax_cdf.grid(True, alpha=0.2)
@@ -248,6 +292,7 @@ def plot_overdensity_distribution_2d(
     delta12: np.ndarray,
     *,
     out: Path,
+    delta_selected: np.ndarray | None = None,
     nbins: int = 160,
     clip_min: float = -1.0 + 1e-12,
     label1: str = r"$\log_{10}(1+\delta_1)$",
@@ -282,9 +327,24 @@ def plot_overdensity_distribution_2d(
     im = ax.pcolormesh(xedges, yedges, H.T, shading="auto", norm=norm, cmap="viridis")
     cbar = fig.colorbar(im, ax=ax, pad=0.02)
     cbar.set_label("Count per bin")
+    if delta_selected is not None:
+        ds = np.asarray(delta_selected, dtype=np.float64)
+        if ds.ndim == 2 and ds.shape[1] == 2:
+            ms = (
+                np.isfinite(ds[:, 0])
+                & np.isfinite(ds[:, 1])
+                & (ds[:, 0] > float(clip_min))
+                & (ds[:, 1] > float(clip_min))
+            )
+            if np.any(ms):
+                xs1 = np.log10(1.0 + np.clip(ds[ms, 0], float(clip_min), None))
+                xs2 = np.log10(1.0 + np.clip(ds[ms, 1], float(clip_min), None))
+                ax.scatter(xs1, xs2, s=10, c="tab:orange", alpha=0.6, linewidths=0, label=f"Selected (S={int(xs1.size)})")
     ax.set_xlabel(label1)
     ax.set_ylabel(label2)
     ax.set_title(f"Overdensity 2D histogram (N={int(x1.size):,}, corr={corr:.3f})")
+    if delta_selected is not None:
+        ax.legend(loc="best", frameon=False)
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=200)
@@ -298,6 +358,7 @@ def plot_global_hmf_comparison(
     n_true: np.ndarray,
     n_true_lo: np.ndarray,
     n_true_hi: np.ndarray,
+    n_base: np.ndarray | None = None,
     out: Path,
 ) -> None:
     import matplotlib
@@ -310,26 +371,41 @@ def plot_global_hmf_comparison(
     n_true = np.asarray(n_true, dtype=np.float64)
     n_true_lo = np.asarray(n_true_lo, dtype=np.float64)
     n_true_hi = np.asarray(n_true_hi, dtype=np.float64)
+    n_base = None if n_base is None else np.asarray(n_base, dtype=np.float64)
 
     fig, (ax, axr) = plt.subplots(2, 1, figsize=(7.5, 7.5), constrained_layout=True, sharex=True, gridspec_kw={"height_ratios": [2, 1]})
     ax.plot(log10M, n_true, lw=2, label="True (full box)")
     ax.fill_between(log10M, n_true_lo, n_true_hi, alpha=0.25, linewidth=0, label="True (Garwood 1σ)")
     ax.plot(log10M, n_pred, lw=2, label="Emulator ⟨n(M|δ)⟩")
+    if n_base is not None:
+        ax.plot(log10M, n_base, lw=2, ls="--", color="0.35", label="Baseline model")
     ax.set_yscale("log")
     ax.set_ylabel(r"$dn/d\log_{10}M\;[\mathrm{Mpc}^{-3}]$")
     ax.legend(frameon=False)
 
     with np.errstate(divide="ignore", invalid="ignore"):
         ratio = n_pred / n_true
-        ratio_lo = n_pred / n_true_hi
-        ratio_hi = n_pred / n_true_lo
+        # Shot-noise (Poisson) uncertainty on the *true* curve only (Garwood interval).
+        # Plot as a band around 1 in ratio space.
+        shot_lo = n_true_lo / n_true
+        shot_hi = n_true_hi / n_true
+        ratio_base = None if n_base is None else (n_base / n_true)
     axr.axhline(1.0, color="k", lw=1, alpha=0.6)
+    axr.fill_between(log10M, shot_lo, shot_hi, alpha=0.18, linewidth=0, color="k", label="Shot noise (Garwood 1σ)")
     axr.plot(log10M, ratio, lw=2)
-    axr.fill_between(log10M, ratio_lo, ratio_hi, alpha=0.20, linewidth=0)
+    if ratio_base is not None:
+        axr.plot(log10M, ratio_base, lw=2, ls="--", color="0.35", label="Baseline / true")
     axr.set_xlabel(r"$\log_{10}(M / 10^{10}\,M_\odot)$")
-    axr.set_ylabel("Pred / true")
-    axr.set_ylim(0.0, 2.0)
+    axr.set_ylabel("Ratio")
+    y_max = 2.0
+    for arr in [ratio, shot_hi, ratio_base]:
+        if arr is None:
+            continue
+        if np.any(np.isfinite(arr)):
+            y_max = max(y_max, float(np.nanmax(arr)) * 1.05)
+    axr.set_ylim(0.0, min(10.0, y_max))
     axr.grid(True, alpha=0.2)
+    axr.legend(frameon=False, loc="best")
 
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -627,15 +703,29 @@ def main() -> None:
 
         plot_path = args.delta_fit_plot if args.delta_fit_plot is not None else (outdir / f"global_hmf_overdensity_fit_{Path(args.model).stem}.png")
         dmu = np.asarray(model.get("delta_mu", np.asarray([0.0])), dtype=np.float64).reshape(-1)
+        delta_selected = None
+        if "delta_train" in model:
+            delta_selected = np.asarray(model["delta_train"], dtype=np.float64)
         if args.delta_method == "empirical":
             if dmu.size == 1:
-                delta_1d = np.asarray(delta_used[:, 1], dtype=np.float64).reshape(-1, 1)
-                plot_overdensity_distribution(delta_1d[:, 0], out=Path(plot_path), nbins=int(args.delta_fit_nbins))
+                # For 1D models, use the second kernel as the default delta axis in this 2-kernel loader.
+                delta_1d = np.asarray(delta_used[:, 1], dtype=np.float64).reshape(-1)
+                sel_1d = None
+                if delta_selected is not None:
+                    ds = np.asarray(delta_selected, dtype=np.float64)
+                    sel_1d = ds if ds.ndim == 1 else ds[:, -1]
+                plot_overdensity_distribution(
+                    delta_1d,
+                    out=Path(plot_path),
+                    nbins=int(args.delta_fit_nbins),
+                    delta_selected=sel_1d,
+                )
             else:
                 plot_overdensity_distribution_2d(
                     delta_used,
                     out=Path(plot_path),
                     nbins=int(args.delta_fit_nbins),
+                    delta_selected=delta_selected,
                     label1=rf"$\log_{{10}}(1+\delta_{{R={float(kr1):g}}})$",
                     label2=rf"$\log_{{10}}(1+\delta_{{R={float(kr2):g}}})$",
                 )
@@ -655,6 +745,7 @@ def main() -> None:
                 skew=float(fit["skew"]),
                 kurt_excess=float(fit["kurt_excess"]),
                 out=Path(plot_path),
+                delta_selected=(None if delta_selected is None else (np.asarray(delta_selected) if np.asarray(delta_selected).ndim == 1 else np.asarray(delta_selected)[:, -1])),
                 nbins=int(args.delta_fit_nbins),
             )
             print(f"Saved {plot_path}")
@@ -700,12 +791,14 @@ def main() -> None:
 
             outdir = Path(__file__).resolve().parent.parent / "plots"
             hmf_plot = args.hmf_plot if args.hmf_plot is not None else (outdir / f"global_hmf_compare_{Path(args.model).stem}.png")
+            n_base = np.exp(np.asarray(model["log_n_base"], dtype=np.float64))
             plot_global_hmf_comparison(
                 log10M=log10M,
                 n_pred=n_global,
                 n_true=n_true,
                 n_true_lo=n_true_lo,
                 n_true_hi=n_true_hi,
+                n_base=n_base,
                 out=Path(hmf_plot),
             )
             print(f"Saved {hmf_plot}")
