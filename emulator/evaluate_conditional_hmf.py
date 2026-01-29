@@ -869,18 +869,53 @@ def main() -> None:
     mode0_pred = np.mean(lam_pred < 1.0, axis=0)
     median0_pred = np.mean(lam_pred <= np.log(2.0), axis=0)
 
-    # fig, ax = plt.subplots(figsize=(7.5, 4.8), constrained_layout=True)
-    # ax.plot(log10M_centers, p0_obs, lw=2, label="Observed frac(N=0)")
-    # ax.plot(log10M_centers, p0_pred, lw=2, label="Emulator mean P(N=0)")
-    # ax.plot(log10M_centers, p0_base, lw=1.5, ls="--", label="Baseline mean P(N=0)")
-    # ax.plot(log10M_centers, mode0_pred, lw=1.5, ls=":", label="Emulator frac(mode=0)")
-    # ax.plot(log10M_centers, median0_pred, lw=1.5, ls="-.", label="Emulator frac(median=0)")
-    # ax.set_ylim(-0.02, 1.02)
-    # ax.set_xlabel(r"$\log_{10}(M / 10^{10}\,M_\odot)$")
-    # ax.set_ylabel("Zero-count probability")
-    # ax.legend(frameon=False)
-    # fig.savefig(outdir / "conditional_hmf_eval_pzero_by_mass.png", dpi=150)
-    # plt.close(fig)
+    fig, ax = plt.subplots(figsize=(7.5, 4.8), constrained_layout=True)
+    ax.plot(log10M_centers, p0_obs, lw=2, label="Observed frac(N=0)")
+    ax.plot(log10M_centers, p0_pred, lw=2, label="Emulator mean P(N=0)")
+    ax.plot(log10M_centers, p0_base, lw=1.5, ls="--", label="Baseline mean P(N=0)")
+    ax.plot(log10M_centers, mode0_pred, lw=1.5, ls=":", label="Emulator frac(mode=0)")
+    ax.plot(log10M_centers, median0_pred, lw=1.5, ls="-.", label="Emulator frac(median=0)")
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_xlabel(r"$\log_{10}(M / 10^{10}\,M_\odot)$")
+    ax.set_ylabel("Zero-count probability")
+    ax.legend(frameon=False)
+    fig.savefig(outdir / "conditional_hmf_eval_pzero_by_mass.png", dpi=150)
+    plt.close(fig)
+
+    # Leakage diagnostic: distribution of predicted lambda in spheres where N=0 (per mass bin).
+    # If these lambdas are not << 1, the model will systematically overpredict rare counts.
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.5), constrained_layout=True, sharey=True)
+    q = [50.0, 90.0, 99.0]
+    for ax, lab, lam in [(axes[0], "Emulator", lam_pred), (axes[1], "Baseline", lam_base)]:
+        med = np.full(int(dlog10M.size), np.nan)
+        p90 = np.full(int(dlog10M.size), np.nan)
+        p99 = np.full(int(dlog10M.size), np.nan)
+        frac0 = np.mean(N == 0, axis=0)
+        for j in range(int(dlog10M.size)):
+            m = N[:, j] == 0
+            if not np.any(m):
+                continue
+            vals = np.asarray(lam[m, j], dtype=np.float64)
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                continue
+            med[j], p90[j], p99[j] = np.percentile(vals, q)
+        ax.axhline(1.0, color="k", lw=1, alpha=0.35)
+        ax.plot(log10M_centers, med, lw=2, label="median λ | N=0")
+        ax.plot(log10M_centers, p90, lw=1.8, ls="--", label="p90 λ | N=0")
+        ax.plot(log10M_centers, p99, lw=1.8, ls=":", label="p99 λ | N=0")
+        ax2 = ax.twinx()
+        ax2.plot(log10M_centers, frac0, color="0.5", lw=1.5, alpha=0.7)
+        ax2.set_ylim(0.0, 1.0)
+        ax2.set_ylabel("frac(N=0)")
+        ax.set_yscale("log")
+        ax.set_title(lab)
+        ax.set_xlabel(r"$\log_{10}(M / 10^{10}\,M_\odot)$")
+        if ax is axes[0]:
+            ax.set_ylabel(r"Predicted $\lambda$ in spheres with $N=0$")
+        ax.legend(frameon=False, fontsize=9, loc="best")
+    fig.savefig(outdir / "conditional_hmf_eval_lambda_given_zero.png", dpi=150)
+    plt.close(fig)
 
     # Performance vs overdensity: average normalized (negative) log-likelihood in log(1+delta) quantile bins.
     # Using -ll turns "error" into a positive quantity where larger means worse fit.
