@@ -895,7 +895,11 @@ def main() -> None:
             m = N[:, j] == 0
             if not np.any(m):
                 continue
-            vals = np.asarray(lam[m, j], dtype=np.float64)
+            # lam_pred has shape (S,J); lam_base has shape (1,J).
+            if lam.shape[0] == 1:
+                vals = np.full(int(np.sum(m)), float(np.asarray(lam[0, j]).item()), dtype=np.float64)
+            else:
+                vals = np.asarray(lam[m, j], dtype=np.float64)
             vals = vals[np.isfinite(vals)]
             if vals.size == 0:
                 continue
