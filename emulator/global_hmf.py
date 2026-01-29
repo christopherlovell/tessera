@@ -287,6 +287,8 @@ def plot_global_hmf_comparison(
     *,
     log10M: np.ndarray,
     n_pred: np.ndarray,
+    n_pred_lo: np.ndarray | None = None,
+    n_pred_hi: np.ndarray | None = None,
     n_true: np.ndarray,
     n_true_lo: np.ndarray,
     n_true_hi: np.ndarray,
@@ -300,6 +302,8 @@ def plot_global_hmf_comparison(
 
     log10M = np.asarray(log10M, dtype=np.float64)
     n_pred = np.asarray(n_pred, dtype=np.float64)
+    n_pred_lo = None if n_pred_lo is None else np.asarray(n_pred_lo, dtype=np.float64)
+    n_pred_hi = None if n_pred_hi is None else np.asarray(n_pred_hi, dtype=np.float64)
     n_true = np.asarray(n_true, dtype=np.float64)
     n_true_lo = np.asarray(n_true_lo, dtype=np.float64)
     n_true_hi = np.asarray(n_true_hi, dtype=np.float64)
@@ -309,6 +313,8 @@ def plot_global_hmf_comparison(
     ax.plot(log10M, n_true, lw=2, label="True (full box)")
     ax.fill_between(log10M, n_true_lo, n_true_hi, alpha=0.25, linewidth=0, label="True (Garwood 1σ)")
     ax.plot(log10M, n_pred, lw=2, label="Emulator ⟨n(M|δ)⟩")
+    if n_pred_lo is not None and n_pred_hi is not None:
+        ax.fill_between(log10M, n_pred_lo, n_pred_hi, alpha=0.18, linewidth=0, label="Emulator (GP 68%)")
     if n_base is not None:
         ax.plot(log10M, n_base, lw=2, ls="--", color="0.35", label="Baseline model")
     ax.set_yscale("log")
@@ -321,9 +327,13 @@ def plot_global_hmf_comparison(
         # Plot as a band around 1 in ratio space.
         shot_lo = n_true_lo / n_true
         shot_hi = n_true_hi / n_true
+        gp_lo = None if n_pred_lo is None else (n_pred_lo / n_true)
+        gp_hi = None if n_pred_hi is None else (n_pred_hi / n_true)
         ratio_base = None if n_base is None else (n_base / n_true)
     axr.axhline(1.0, color="k", lw=1, alpha=0.6)
     axr.fill_between(log10M, shot_lo, shot_hi, alpha=0.18, linewidth=0, color="k", label="Shot noise (Garwood 1σ)")
+    if gp_lo is not None and gp_hi is not None:
+        axr.fill_between(log10M, gp_lo, gp_hi, alpha=0.12, linewidth=0, color="tab:blue", label="Emulator (GP 68%)")
     axr.plot(log10M, ratio, lw=2)
     if ratio_base is not None:
         axr.plot(log10M, ratio_base, lw=2, ls="--", color="0.35", label="Baseline / true")
@@ -378,6 +388,99 @@ def _predict_log_n_batch(model: dict, delta_eval: np.ndarray) -> np.ndarray:
     return np.asarray(log_n)
 
 
+def _gp_posterior_cache(model: dict) -> dict[str, object]:
+    """
+    Build cached GP quantities that depend only on the trained model and training deltas.
+
+    This avoids recomputing Cholesky factors for every delta batch when integrating.
+    """
+    from tessera.emulator.conditional_hmf import _rbf_kernel
+
+    dtype = jnp.float64 if bool(jax.config.read("jax_enable_x64")) else jnp.float32
+    Phi = jnp.asarray(model["Phi"], dtype=dtype)
+    log_n_base = jnp.asarray(model["log_n_base"], dtype=dtype)
+    delta_train = jnp.asarray(model["delta_train"], dtype=dtype)
+    delta_mu = float(model["delta_mu"])
+    delta_sig = float(model["delta_sig"]) + 1e-12
+
+    amp = jnp.exp(jnp.asarray(model["log_amp"], dtype=dtype))
+    ell = jnp.exp(jnp.asarray(model["log_ell"], dtype=dtype))
+    jit = jnp.exp(jnp.asarray(model["log_jitter"], dtype=dtype))
+    Z = jnp.asarray(model["Z"], dtype=dtype)
+
+    delta_t = (delta_train - delta_mu) / delta_sig
+
+    Ls = []
+    vs = []
+    for k in range(Phi.shape[0]):
+        Kk = _rbf_kernel(jnp, delta_t, amp[k], ell[k], jit[k])
+        Lk = jnp.linalg.cholesky(Kk)
+        v = jsp.linalg.solve_triangular(Lk.T, Z[k], lower=False)
+        Ls.append(Lk)
+        vs.append(v)
+
+    return {
+        "dtype": dtype,
+        "Phi": Phi,
+        "Phi2": Phi * Phi,
+        "log_n_base": log_n_base,
+        "delta_t": delta_t,
+        "delta_mu": delta_mu,
+        "delta_sig": delta_sig,
+        "amp": amp,
+        "ell": ell,
+        "jit": jit,
+        "Ls": tuple(Ls),
+        "vs": tuple(vs),
+    }
+
+
+def _predict_log_n_batch_mean_var(cache: dict[str, object], delta_eval: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Return predictive mean and variance of log n(M|delta) under the GP posterior.
+
+    Notes:
+    - Uses the standard GP conditional variance with K_train that includes the learned jitter term.
+    - Returns the variance of the latent GP function (does not add jitter again).
+    - Assumes independent GPs per mass-basis coefficient (as in training).
+    """
+    dtype = cache["dtype"]  # type: ignore[assignment]
+    Phi = cache["Phi"]  # type: ignore[assignment]
+    Phi2 = cache["Phi2"]  # type: ignore[assignment]
+    log_n_base = cache["log_n_base"]  # type: ignore[assignment]
+    delta_t = cache["delta_t"]  # type: ignore[assignment]
+    delta_mu = float(cache["delta_mu"])  # type: ignore[arg-type]
+    delta_sig = float(cache["delta_sig"])  # type: ignore[arg-type]
+    amp = cache["amp"]  # type: ignore[assignment]
+    ell = cache["ell"]  # type: ignore[assignment]
+    Ls = cache["Ls"]  # type: ignore[assignment]
+    vs = cache["vs"]  # type: ignore[assignment]
+
+    delta_eval_t = (jnp.asarray(delta_eval, dtype=dtype) - delta_mu) / delta_sig
+
+    mu_coeffs = []
+    var_coeffs = []
+    for k in range(Phi.shape[0]):
+        Lk = Ls[k]
+        v = vs[k]
+        d = delta_t[:, None] - delta_eval_t[None, :]
+        k_star = (amp[k] ** 2) * jnp.exp(-0.5 * (d**2) / (ell[k] ** 2))
+        mu_k = k_star.T @ v
+
+        w = jsp.linalg.solve_triangular(Lk, k_star, lower=True)
+        var_k = (amp[k] ** 2) - jnp.sum(w * w, axis=0)
+        var_k = jnp.clip(var_k, 0.0, jnp.inf)
+
+        mu_coeffs.append(mu_k)
+        var_coeffs.append(var_k)
+
+    mu_coeffs = jnp.stack(mu_coeffs, axis=1)  # (B, K)
+    var_coeffs = jnp.stack(var_coeffs, axis=1)  # (B, K)
+    mean_log_n = log_n_base[None, :] + (mu_coeffs @ Phi)
+    var_log_n = var_coeffs @ Phi2
+    return np.asarray(mean_log_n), np.asarray(var_log_n)
+
+
 def integrate_global_hmf_mc(
     model: dict,
     *,
@@ -406,8 +509,11 @@ def integrate_global_hmf_mc(
         raise FloatingPointError("Edgeworth weights are not usable (sum <= 0).")
 
     delta = np.exp(y) - 1.0
-    log_n = _predict_log_n_batch(model, delta)  # (n_mc, J)
-    n_global = np.sum((w[:, None] / sw) * np.exp(log_n), axis=0)
+    cache = _gp_posterior_cache(model)
+    mean_log_n, var_log_n = _predict_log_n_batch_mean_var(cache, delta)  # (n_mc,J), (n_mc,J)
+    # Lognormal correction: E[exp(X)] for X~N(mean,var) is exp(mean + 0.5 var).
+    n_mean = np.exp(mean_log_n + 0.5 * var_log_n)
+    n_global = np.sum((w[:, None] / sw) * n_mean, axis=0)
     edges = np.asarray(model["log10M_edges"], dtype=np.float64)
     centers = 0.5 * (edges[:-1] + edges[1:])
     return centers, np.asarray(n_global, dtype=np.float64)
@@ -418,7 +524,9 @@ def integrate_global_hmf_empirical(
     *,
     delta_samples: np.ndarray,
     batch_size: int = 4096,
-) -> tuple[np.ndarray, np.ndarray]:
+    gp_draws: int = 0,
+    seed: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
     """
     Empirical estimate of:
         n_global(M) = E_{empirical p(delta)}[ n(M|delta) ]
@@ -437,17 +545,45 @@ def integrate_global_hmf_empirical(
     edges = np.asarray(model["log10M_edges"], dtype=np.float64)
     centers = 0.5 * (edges[:-1] + edges[1:])
 
-    acc = None
+    cache = _gp_posterior_cache(model)
+    J = int(centers.size)
+    acc = np.zeros((J,), dtype=np.float64)
+    draws = int(gp_draws)
+    draw_sums = None
+    rng = None
+    if draws > 0:
+        draw_sums = np.zeros((draws, J), dtype=np.float64)
+        rng = np.random.default_rng(int(seed) + 1234)
+
     n_total = int(delta_samples.size)
     for start in range(0, n_total, batch_size):
         d = delta_samples[start : start + batch_size]
-        log_n = _predict_log_n_batch(model, d)  # (B, J)
-        n = np.exp(log_n)
-        s = np.sum(n, axis=0)
-        acc = s if acc is None else (acc + s)
+        mean_log_n, var_log_n = _predict_log_n_batch_mean_var(cache, d)  # (B,J), (B,J)
+        n_mean = np.exp(mean_log_n + 0.5 * var_log_n)
+        acc = acc + np.sum(n_mean, axis=0)
+
+        if draws > 0 and draw_sums is not None and rng is not None:
+            # Monte Carlo propagation of GP predictive uncertainty, assuming per-delta independence.
+            sd = np.sqrt(np.maximum(var_log_n, 0.0))
+            # Chunk draws to keep memory bounded.
+            chunk = 16
+            B, Jb = mean_log_n.shape
+            for ds0 in range(0, draws, chunk):
+                ds1 = min(draws, ds0 + chunk)
+                eps = rng.normal(size=(ds1 - ds0, B, Jb)).astype(np.float64)
+                n_draw = np.exp(mean_log_n[None, :, :] + sd[None, :, :] * eps)
+                draw_sums[ds0:ds1, :] += np.sum(n_draw, axis=1)
 
     n_global = acc / float(n_total)
-    return centers, np.asarray(n_global, dtype=np.float64)
+
+    n_lo = None
+    n_hi = None
+    if draws > 0 and draw_sums is not None:
+        n_draws = draw_sums / float(n_total)
+        n_lo = np.percentile(n_draws, 16.0, axis=0)
+        n_hi = np.percentile(n_draws, 84.0, axis=0)
+
+    return centers, np.asarray(n_global, dtype=np.float64), n_lo, n_hi
 
 
 def main() -> None:
@@ -503,6 +639,13 @@ def main() -> None:
         type=int,
         default=0,
         help="If >0, randomly subsample this many delta values from the gridder field for the empirical integral/plot.",
+    )
+    ig.add_argument(
+        "--gp-draws",
+        type=int,
+        default=64,
+        help="If >0, draw from the GP predictive distribution to propagate emulator uncertainty into the global HMF "
+        "(reports a 68% band). Set to 0 to disable.",
     )
     ig.add_argument("--batch-size", type=int, default=4096, help="Batch size for evaluating the emulator over delta samples.")
     ig.add_argument(
@@ -606,7 +749,13 @@ def main() -> None:
         if args.delta_method == "empirical":
             plot_overdensity_distribution(delta_used, out=Path(plot_path), nbins=int(args.delta_fit_nbins), delta_selected=delta_selected)
             print(f"Saved {plot_path}")
-            log10M, n_global = integrate_global_hmf_empirical(model, delta_samples=delta_used, batch_size=int(args.batch_size))
+            log10M, n_global, n_lo, n_hi = integrate_global_hmf_empirical(
+                model,
+                delta_samples=delta_used,
+                batch_size=int(args.batch_size),
+                gp_draws=int(args.gp_draws),
+                seed=int(args.seed),
+            )
         elif args.delta_method == "edgeworth":
             fit = fit_overdensity_edgeworth(delta_used)
             plot_overdensity_distribution_with_fit(
@@ -620,6 +769,8 @@ def main() -> None:
                 nbins=int(args.delta_fit_nbins),
             )
             print(f"Saved {plot_path}")
+            # Edgeworth integration includes GP lognormal correction but does not currently provide a band.
+            n_lo, n_hi = None, None
             log10M, n_global = integrate_global_hmf_mc(
                 model,
                 mu=float(fit["mu"]),
@@ -666,6 +817,8 @@ def main() -> None:
             plot_global_hmf_comparison(
                 log10M=log10M,
                 n_pred=n_global,
+                n_pred_lo=n_lo,
+                n_pred_hi=n_hi,
                 n_true=n_true,
                 n_true_lo=n_true_lo,
                 n_true_hi=n_true_hi,
