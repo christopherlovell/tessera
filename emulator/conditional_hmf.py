@@ -833,6 +833,10 @@ def train_map(
     S: int,
     steps: int = 5000,
     lr: float = 1e-2,
+    lr_schedule: str = "constant",
+    lr_min: float = 0.0,
+    lr_decay: float = 0.0,
+    lr_warmup: int = 0,
     seed: int = 0,
     jit: bool = True,
     init_jitter: float = 1e-2,
@@ -858,6 +862,47 @@ def train_map(
         leaves = jax.tree_util.tree_leaves(tree)
         return jnp.sqrt(sum([jnp.sum(jnp.square(x)) for x in leaves]))
 
+    lr0 = float(lr)
+    lr_floor = float(lr_min)
+    warmup_steps = int(lr_warmup)
+    total_steps = int(steps)
+    decay = float(lr_decay)
+
+    def lr_at(t):
+        # t is 1-based (int32) inside the optimizer step.
+        t = jnp.asarray(t, dtype=jnp.float32)
+
+        # Linear warmup from 0 -> lr0 over warmup_steps.
+        if warmup_steps > 0:
+            w = jnp.clip(t / float(warmup_steps), 0.0, 1.0)
+            lr_w = lr0 * w
+        else:
+            lr_w = lr0
+
+        if lr_schedule == "constant":
+            return lr_w
+
+        # After warmup, apply a schedule relative to lr0.
+        if total_steps <= warmup_steps:
+            return lr_w
+
+        t2 = jnp.maximum(0.0, t - float(warmup_steps))
+        denom = float(total_steps - warmup_steps)
+        prog = jnp.clip(t2 / denom, 0.0, 1.0)
+
+        if lr_schedule == "cosine":
+            lr_s = lr_floor + 0.5 * (lr0 - lr_floor) * (1.0 + jnp.cos(jnp.pi * prog))
+        elif lr_schedule == "linear":
+            lr_s = lr_floor + (lr0 - lr_floor) * (1.0 - prog)
+        elif lr_schedule == "exp":
+            lr_s = lr0 * jnp.exp(-decay * t2)
+            lr_s = jnp.maximum(lr_floor, lr_s)
+        else:
+            raise ValueError(f"Unsupported lr_schedule: {lr_schedule!r}")
+
+        # During warmup, cap at lr_w (smooth transition); afterward lr_s is <= lr0 typically.
+        return jnp.minimum(lr_w, lr_s)
+
     def step(params, m, v, t):
         val, grads = jax.value_and_grad(loss_fn)(params)
         if float(clip_grad_norm) > 0:
@@ -870,7 +915,8 @@ def train_map(
         v = jax.tree_util.tree_map(lambda a, g: b2 * a + (1 - b2) * (g * g), v, grads)
         mhat = jax.tree_util.tree_map(lambda a: a / (1 - b1**t), m)
         vhat = jax.tree_util.tree_map(lambda a: a / (1 - b2**t), v)
-        params = jax.tree_util.tree_map(lambda p, mh, vh: p - lr * mh / (jnp.sqrt(vh) + eps), params, mhat, vhat)
+        lr_t = lr_at(t)
+        params = jax.tree_util.tree_map(lambda p, mh, vh: p - lr_t * mh / (jnp.sqrt(vh) + eps), params, mhat, vhat)
         return params, m, v, t, val
     step = jax.jit(step) if jit else step
 
@@ -1285,6 +1331,31 @@ def main():
     tr.add_argument("--K", type=int, default=6, help="Number of PCA modes (excluding intercept).")
     tr.add_argument("--steps", type=int, default=5000)
     tr.add_argument("--lr", type=float, default=1e-3)
+    tr.add_argument(
+        "--lr-schedule",
+        type=str,
+        default="constant",
+        choices=["constant", "cosine", "linear", "exp"],
+        help="Learning-rate schedule (applied to Adam step size).",
+    )
+    tr.add_argument(
+        "--lr-min",
+        type=float,
+        default=0.0,
+        help="Minimum learning rate used by --lr-schedule (0 disables floor).",
+    )
+    tr.add_argument(
+        "--lr-decay",
+        type=float,
+        default=0.0,
+        help="Exponential decay rate per step for --lr-schedule=exp (0 disables).",
+    )
+    tr.add_argument(
+        "--lr-warmup",
+        type=int,
+        default=0,
+        help="Warmup steps: linearly ramp lr from 0 to --lr over this many steps.",
+    )
     tr.add_argument("--alpha-cons", type=float, default=0)
     tr.add_argument(
         "--beta-tail",
@@ -1432,12 +1503,21 @@ def main():
             tail_eps=float(args.tail_eps),
             jit=not bool(args.no_jit),
         )
+        print(
+            "lr_schedule "
+            f"{str(args.lr_schedule)} lr={float(args.lr):g} lr_min={float(args.lr_min):g} "
+            f"lr_decay={float(args.lr_decay):g} lr_warmup={int(args.lr_warmup)}"
+        )
         params = train_map(
             loss_fn,
             K=Phi.shape[0],
             S=ds.delta.size,
             steps=int(args.steps),
             lr=float(args.lr),
+            lr_schedule=str(args.lr_schedule),
+            lr_min=float(args.lr_min),
+            lr_decay=float(args.lr_decay),
+            lr_warmup=int(args.lr_warmup),
             seed=int(args.seed),
             jit=not bool(args.no_jit),
             init_jitter=float(args.init_jitter),
