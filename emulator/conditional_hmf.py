@@ -721,6 +721,53 @@ def pca_mass_basis(
     return np.asarray(Phi, dtype=np.float64)
 
 
+def bspline_mass_basis(
+    log10M_centers: np.ndarray,
+    *,
+    n_basis: int,
+    degree: int = 2,
+) -> np.ndarray:
+    """
+    Build a B-spline basis matrix evaluated at log10M_centers.
+
+    Returns Phi with shape (n_basis, J), where J=len(log10M_centers).
+    This is used exactly like the PCA basis in the model: log_n = log_n_base + (A^T @ Phi).
+    """
+    from scipy.interpolate import BSpline
+
+    x = np.asarray(log10M_centers, dtype=np.float64).reshape(-1)
+    if x.size < 2:
+        raise ValueError("Need at least 2 mass bins to build a B-spline basis.")
+    if int(degree) < 0:
+        raise ValueError(f"degree must be >= 0 (got {degree})")
+    if int(n_basis) < int(degree) + 1:
+        raise ValueError(f"n_basis must be >= degree+1 (got n_basis={n_basis}, degree={degree})")
+    if int(n_basis) > int(x.size):
+        raise ValueError(f"n_basis must be <= #mass bins J={int(x.size)} (got n_basis={n_basis})")
+
+    x_min = float(np.min(x))
+    x_max = float(np.max(x))
+    # Avoid the right boundary being treated as outside for open knot vectors.
+    x_eval = np.minimum(x, np.nextafter(x_max, x_min))
+
+    p = int(degree)
+    nb = int(n_basis)
+    n_internal = nb - p - 1
+    if n_internal > 0:
+        internal = np.linspace(x_min, x_max, n_internal + 2, dtype=np.float64)[1:-1]
+        t = np.concatenate([np.full(p + 1, x_min), internal, np.full(p + 1, x_max)]).astype(np.float64)
+    else:
+        t = np.concatenate([np.full(p + 1, x_min), np.full(p + 1, x_max)]).astype(np.float64)
+
+    Phi = np.zeros((nb, x_eval.size), dtype=np.float64)
+    for i in range(nb):
+        c = np.zeros((nb,), dtype=np.float64)
+        c[i] = 1.0
+        Phi[i] = BSpline(t, c, p, extrapolate=False)(x_eval)
+    Phi = np.nan_to_num(Phi, nan=0.0, posinf=0.0, neginf=0.0)
+    return Phi
+
+
 def _rbf_kernel(jnp, delta: "jnp.ndarray", amp: "jnp.ndarray", ell: "jnp.ndarray", jitter: "jnp.ndarray"):
     d = delta[:, None] - delta[None, :]
     K = (amp**2) * jnp.exp(-0.5 * (d**2) / (ell**2))
@@ -960,6 +1007,8 @@ def save_emulator(
     delta_train: np.ndarray,
     train_center_idx: np.ndarray | None,
     train_gridder_file: Path | None,
+    mass_basis: str | None = None,
+    bspline_degree: int | None = None,
     baseline_mode: str | None = None,
     beta_tail: float | None = None,
     tail_top_bins: int | None = None,
@@ -979,6 +1028,10 @@ def save_emulator(
             f.attrs["kernel_radius"] = float(kernel_radius)
             if train_gridder_file is not None:
                 f.attrs["gridder_file"] = str(Path(train_gridder_file))
+            if mass_basis is not None:
+                f.attrs["mass_basis"] = str(mass_basis)
+            if bspline_degree is not None:
+                f.attrs["bspline_degree"] = int(bspline_degree)
             if baseline_mode is not None:
                 f.attrs["baseline_mode"] = str(baseline_mode)
             if beta_tail is not None:
@@ -1026,6 +1079,16 @@ def save_emulator(
                 else {}
             ),
             **(
+                {"mass_basis": np.asarray(str(mass_basis), dtype=np.str_)}
+                if mass_basis is not None
+                else {}
+            ),
+            **(
+                {"bspline_degree": np.asarray(int(bspline_degree), dtype=np.int64)}
+                if bspline_degree is not None
+                else {}
+            ),
+            **(
                 {"baseline_mode": np.asarray(str(baseline_mode), dtype=np.str_)}
                 if baseline_mode is not None
                 else {}
@@ -1052,6 +1115,13 @@ def load_emulator(path: Path) -> dict[str, np.ndarray | float]:
                 if isinstance(gf, bytes):
                     gf = gf.decode("utf-8")
                 out["gridder_file"] = str(gf)
+            if "mass_basis" in f.attrs:
+                mb = f.attrs["mass_basis"]
+                if isinstance(mb, bytes):
+                    mb = mb.decode("utf-8")
+                out["mass_basis"] = str(mb)
+            if "bspline_degree" in f.attrs:
+                out["bspline_degree"] = int(f.attrs["bspline_degree"])
             if "baseline_mode" in f.attrs:
                 bm = f.attrs["baseline_mode"]
                 if isinstance(bm, bytes):
@@ -1087,6 +1157,10 @@ def load_emulator(path: Path) -> dict[str, np.ndarray | float]:
         out["mass_pivot_msun"] = 1.0 if float(np.nanmean(edges)) > 8.0 else float(MASS_PIVOT_MSUN)
     if "gridder_file" in out:
         out["gridder_file"] = str(np.asarray(out["gridder_file"]).item())
+    if "mass_basis" in out:
+        out["mass_basis"] = str(np.asarray(out["mass_basis"]).item())
+    if "bspline_degree" in out:
+        out["bspline_degree"] = int(np.asarray(out["bspline_degree"]).item())
     if "baseline_mode" in out:
         out["baseline_mode"] = str(np.asarray(out["baseline_mode"]).item())
     for k in ["beta_tail", "tail_eps"]:
@@ -1329,7 +1403,21 @@ def main():
         help="Make the final mass bin wider by this factor (while keeping the overall [min,max] range fixed). "
         "Set to 1 for equal-width bins.",
     )
-    tr.add_argument("--K", type=int, default=6, help="Number of PCA modes (excluding intercept).")
+    tr.add_argument(
+        "--mass-basis",
+        type=str,
+        default="pca",
+        choices=["pca", "bspline"],
+        help="Mass basis for the GP coefficients. 'pca' learns a PCA basis from training spheres; "
+        "'bspline' uses a fixed B-spline basis in log10M.",
+    )
+    tr.add_argument(
+        "--bspline-degree",
+        type=int,
+        default=2,
+        help="Degree of the B-spline basis used when --mass-basis=bspline.",
+    )
+    tr.add_argument("--K", type=int, default=6, help="Number of basis modes (excluding the intercept for PCA).")
     tr.add_argument("--steps", type=int, default=5000)
     tr.add_argument("--lr", type=float, default=1e-3)
     tr.add_argument(
@@ -1454,7 +1542,15 @@ def main():
             print(f"Wrote {outdir / 'conditional_hmf_train_overabundance.png'}")
         except Exception as e:
             print(f"Warning: failed to write training overabundance plot: {e}")
-        Phi = pca_mass_basis(ds.N, ds.V, ds.dlog10M, ds.log_n_base, K=int(args.K), add_intercept=True)
+        mass_basis = str(args.mass_basis).lower().strip()
+        if mass_basis == "pca":
+            Phi = pca_mass_basis(ds.N, ds.V, ds.dlog10M, ds.log_n_base, K=int(args.K), add_intercept=True)
+        elif mass_basis == "bspline":
+            nb = int(args.K) + 1
+            Phi = bspline_mass_basis(ds.log10M_centers, n_basis=nb, degree=int(args.bspline_degree))
+        else:
+            raise ValueError(f"Unsupported --mass-basis={args.mass_basis!r}")
+        print(f"mass_basis {mass_basis}  Phi_shape {tuple(int(x) for x in np.asarray(Phi.shape))}")
         if args.check_data:
             _print_data_summary(ds, Phi)
             return
@@ -1536,6 +1632,8 @@ def main():
             delta_train=np.asarray(ds.delta, dtype=np.float64),
             train_center_idx=np.asarray(ds.center_idx, dtype=np.int64),
             train_gridder_file=args.gridder_file,
+            mass_basis=str(args.mass_basis),
+            bspline_degree=(int(args.bspline_degree) if str(args.mass_basis).lower().strip() == "bspline" else None),
             baseline_mode=str(args.baseline),
             beta_tail=(float(args.beta_tail) if float(args.beta_tail) > 0.0 else None),
             tail_top_bins=(tail_top_bins if float(args.beta_tail) > 0.0 else None),
