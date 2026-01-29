@@ -1383,6 +1383,8 @@ def train_map(
     D: int,
     steps: int = 5000,
     lr: float = 1e-2,
+    optimizer: str = "adam",
+    weight_decay: float = 0.0,
     seed: int = 0,
     jit: bool = True,
     init_jitter: float = 1e-2,
@@ -1420,7 +1422,23 @@ def train_map(
         v = jax.tree_util.tree_map(lambda a, g: b2 * a + (1 - b2) * (g * g), v, grads)
         mhat = jax.tree_util.tree_map(lambda a: a / (1 - b1**t), m)
         vhat = jax.tree_util.tree_map(lambda a: a / (1 - b2**t), v)
-        params = jax.tree_util.tree_map(lambda p, mh, vh: p - lr * mh / (jnp.sqrt(vh) + eps), params, mhat, vhat)
+        update = jax.tree_util.tree_map(lambda mh, vh: mh / (jnp.sqrt(vh) + eps), mhat, vhat)
+        if optimizer == "adam":
+            params = jax.tree_util.tree_map(lambda p, u: p - lr * u, params, update)
+        elif optimizer == "adamw":
+            wd = float(weight_decay)
+            if wd <= 0.0:
+                params = jax.tree_util.tree_map(lambda p, u: p - lr * u, params, update)
+            else:
+                # Decoupled weight decay. Avoid decaying Z: it already has an explicit Gaussian prior via lp.
+                params = {
+                    "log_amp": params["log_amp"] - lr * (update["log_amp"] + wd * params["log_amp"]),
+                    "log_ell": params["log_ell"] - lr * (update["log_ell"] + wd * params["log_ell"]),
+                    "log_jitter": params["log_jitter"] - lr * (update["log_jitter"] + wd * params["log_jitter"]),
+                    "Z": params["Z"] - lr * update["Z"],
+                }
+        else:
+            raise ValueError(f"Unsupported optimizer: {optimizer!r} (expected 'adam' or 'adamw').")
         return params, m, v, t, val
     step = jax.jit(step) if jit else step
 
@@ -1894,6 +1912,19 @@ def main():
     tr.add_argument("--K", type=int, default=6, help="Number of PCA modes (excluding intercept).")
     tr.add_argument("--steps", type=int, default=5000)
     tr.add_argument("--lr", type=float, default=1e-3)
+    tr.add_argument(
+        "--optimizer",
+        type=str,
+        default="adam",
+        choices=["adam", "adamw"],
+        help="Optimizer for MAP training. Note: the existing implementation is Adam; AdamW adds decoupled weight decay.",
+    )
+    tr.add_argument(
+        "--weight-decay",
+        type=float,
+        default=0.0,
+        help="Decoupled weight decay strength for --optimizer=adamw (0 disables). Applied to GP hyperparameters, not Z.",
+    )
     tr.add_argument("--alpha-cons", type=float, default=0)
     tr.add_argument(
         "--beta-tail",
@@ -2084,6 +2115,8 @@ def main():
             D=int(ds.delta.shape[1]),
             steps=int(args.steps),
             lr=float(args.lr),
+            optimizer=str(args.optimizer),
+            weight_decay=float(args.weight_decay),
             seed=int(args.seed),
             jit=not bool(args.no_jit),
             init_jitter=float(args.init_jitter),
