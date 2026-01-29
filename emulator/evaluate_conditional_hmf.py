@@ -478,6 +478,54 @@ def main() -> None:
     n_lo = clo / (V * dlog10M[None, :])
     n_hi = chi / (V * dlog10M[None, :])
 
+    # Predicted/observed HMF as a function of overdensity (binned in log(1+delta)).
+    # This visualizes how the conditional HMF changes across environments.
+    finite_d = np.isfinite(delta)
+    d_log = np.log1p(np.clip(np.asarray(delta[finite_d], dtype=np.float64), a_min=-1.0 + 1e-12, a_max=None))
+    if d_log.size >= 2:
+        nbins_delta = 12
+        xedges = np.linspace(float(np.min(d_log)), float(np.max(d_log)), nbins_delta + 1, dtype=np.float64)
+        # Avoid degenerate bins if all deltas are identical.
+        xedges = np.unique(xedges)
+        if xedges.size >= 3:
+            bin_idx = np.digitize(d_log, xedges) - 1
+            bin_idx = np.clip(bin_idx, 0, xedges.size - 2)
+
+            mean_pred = np.full((xedges.size - 1, int(dlog10M.size)), np.nan, dtype=np.float64)
+            mean_obs = np.full_like(mean_pred, np.nan)
+            for b in range(xedges.size - 1):
+                m = bin_idx == b
+                if not np.any(m):
+                    continue
+                # Use mean across spheres in the bin.
+                mean_pred[b] = np.mean(np.asarray(n_pred[finite_d][m], dtype=np.float64), axis=0)
+                mean_obs[b] = np.mean(np.asarray(n_obs[finite_d][m], dtype=np.float64), axis=0)
+
+            # Plot as heatmaps in log10 space.
+            eps = 1e-30
+            z_pred = np.log10(np.maximum(mean_pred, eps))
+            z_obs = np.log10(np.maximum(mean_obs, eps))
+            both = np.concatenate([z_pred[np.isfinite(z_pred)], z_obs[np.isfinite(z_obs)]])
+            vmin = float(np.percentile(both, 5)) if both.size else -12.0
+            vmax = float(np.percentile(both, 95)) if both.size else -4.0
+
+            fig, axes = plt.subplots(1, 2, figsize=(12.6, 4.8), constrained_layout=True, sharey=True)
+            yedges = np.asarray(log10M_edges, dtype=np.float64)
+
+            im0 = axes[0].pcolormesh(xedges, yedges, z_pred.T, shading="auto", vmin=vmin, vmax=vmax, cmap="viridis")
+            axes[0].set_title("Predicted mean HMF")
+            axes[0].set_xlabel(r"$\log(1+\delta_R)$ (equal-width bins)")
+            axes[0].set_ylabel(r"$\log_{10}(M / 10^{10}\,M_\odot)$")
+
+            im1 = axes[1].pcolormesh(xedges, yedges, z_obs.T, shading="auto", vmin=vmin, vmax=vmax, cmap="viridis")
+            axes[1].set_title("Observed mean HMF")
+            axes[1].set_xlabel(r"$\log(1+\delta_R)$ (equal-width bins)")
+
+            cbar = fig.colorbar(im1, ax=list(axes), pad=0.01)
+            cbar.set_label(r"$\log_{10}\, dn/d\log_{10}M\;[\mathrm{Mpc}^{-3}]$")
+            fig.savefig(outdir / "conditional_hmf_eval_hmf_vs_delta.png", dpi=150)
+            plt.close(fig)
+
     # Per-mass-bin predicted-vs-observed HMF scatter (one subplot per mass bin).
     # This is like conditional_hmf_eval_counts_by_bin_scatter.png but in dn/dlog10M space.
     ncols_hmf = 2
