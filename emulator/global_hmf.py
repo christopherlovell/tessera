@@ -312,9 +312,10 @@ def plot_global_hmf_comparison(
     fig, (ax, axr) = plt.subplots(2, 1, figsize=(7.5, 7.5), constrained_layout=True, sharex=True, gridspec_kw={"height_ratios": [2, 1]})
     ax.plot(log10M, n_true, lw=2, label="True (full box)")
     ax.fill_between(log10M, n_true_lo, n_true_hi, alpha=0.25, linewidth=0, label="True (Garwood 1σ)")
-    ax.plot(log10M, n_pred, lw=2, label="Emulator ⟨n(M|δ)⟩")
+    pred_line = ax.plot(log10M, n_pred, lw=2, label="Emulator ⟨n(M|δ)⟩")[0]
+    pred_color = pred_line.get_color()
     if n_pred_lo is not None and n_pred_hi is not None:
-        ax.fill_between(log10M, n_pred_lo, n_pred_hi, alpha=0.18, linewidth=0, label="Emulator (GP 68%)")
+        ax.fill_between(log10M, n_pred_lo, n_pred_hi, alpha=0.18, linewidth=0, color=pred_color, label="Emulator (GP 68%)")
     if n_base is not None:
         ax.plot(log10M, n_base, lw=2, ls="--", color="0.35", label="Baseline model")
     ax.set_yscale("log")
@@ -333,8 +334,8 @@ def plot_global_hmf_comparison(
     axr.axhline(1.0, color="k", lw=1, alpha=0.6)
     axr.fill_between(log10M, shot_lo, shot_hi, alpha=0.18, linewidth=0, color="k", label="Shot noise (Garwood 1σ)")
     if gp_lo is not None and gp_hi is not None:
-        axr.fill_between(log10M, gp_lo, gp_hi, alpha=0.12, linewidth=0, color="tab:blue", label="Emulator (GP 68%)")
-    axr.plot(log10M, ratio, lw=2)
+        axr.fill_between(log10M, gp_lo, gp_hi, alpha=0.12, linewidth=0, color=pred_color, label="Emulator (GP 68%)")
+    axr.plot(log10M, ratio, lw=2, color=pred_color)
     if ratio_base is not None:
         axr.plot(log10M, ratio_base, lw=2, ls="--", color="0.35", label="Baseline / true")
     axr.set_xlabel(r"$\log_{10}(M / 10^{10}\,M_\odot)$")
