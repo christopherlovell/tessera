@@ -917,7 +917,7 @@ def train_map(
         vhat = jax.tree_util.tree_map(lambda a: a / (1 - b2**t), v)
         lr_t = lr_at(t)
         params = jax.tree_util.tree_map(lambda p, mh, vh: p - lr_t * mh / (jnp.sqrt(vh) + eps), params, mhat, vhat)
-        return params, m, v, t, val
+        return params, m, v, t, val, lr_t
     step = jax.jit(step) if jit else step
 
     val0 = float(loss_fn(params))
@@ -928,7 +928,7 @@ def train_map(
         )
 
     for i in range(int(steps)):
-        params, m, v, t, val = step(params, m, v, t)
+        params, m, v, t, val, lr_t = step(params, m, v, t)
         if not np.isfinite(float(val)):
             log_amp = np.asarray(params["log_amp"])
             log_ell = np.asarray(params["log_ell"])
@@ -943,7 +943,7 @@ def train_map(
                 "Non-finite loss encountered. Re-run with `--debug-nans --no-jit --x64` and/or increase `--init-jitter`."
             )
         if int(print_every) > 0 and (i % int(print_every) == 0):
-            print(i, float(val))
+            print(i, float(val), float(lr_t))
     return params
 
 
