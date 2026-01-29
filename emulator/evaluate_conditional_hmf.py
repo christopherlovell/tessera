@@ -499,16 +499,55 @@ def main() -> None:
         n_mean0 = np.exp(mean_log_n0 + 0.5 * var_log_n0)  # lognormal mean
         n_lo0 = np.exp(mean_log_n0 - sd0)
         n_hi0 = np.exp(mean_log_n0 + sd0)
+        n_lo2 = np.exp(mean_log_n0 - 2.0 * sd0)
+        n_hi2 = np.exp(mean_log_n0 + 2.0 * sd0)
+
+        sd_min = float(np.min(sd0)) if sd0.size else float("nan")
+        sd_max = float(np.max(sd0)) if sd0.size else float("nan")
+        if np.isfinite(sd_max) and sd_max == 0.0:
+            print("Warning: GP predictive std for log n(M|delta0) is zero (or numerically clipped to zero).")
+        else:
+            print(f"hmf_at_delta delta0={delta0:.6g}  sd_log_n[min,max]=({sd_min:.3g},{sd_max:.3g})")
 
         fig, ax = plt.subplots(figsize=(7.5, 5.5), constrained_layout=True)
+        ax.fill_between(log10M_centers, n_lo2, n_hi2, alpha=0.12, linewidth=0, label="Emulator GP 95% (lognormal)")
         ax.fill_between(log10M_centers, n_lo0, n_hi0, alpha=0.22, linewidth=0, label="Emulator GP 68% (lognormal)")
         ax.plot(log10M_centers, n_mean0, lw=2, label="Emulator mean")
         ax.plot(log10M_centers, n_med0, lw=1.8, ls="-.", label="Emulator median")
         ax.plot(log10M_centers, np.exp(log_n_base), lw=1.6, ls="--", color="0.35", label="Baseline")
+
+        # Overlay observed HMFs from training spheres in a small overdensity window around delta0.
+        train_idx = None
+        if "train_center_idx" in model:
+            train_idx = np.asarray(model["train_center_idx"], dtype=np.int64).ravel()
+            if train_idx.size == 0:
+                train_idx = None
+        if train_idx is not None and "delta_train" in model:
+            dtr = np.asarray(model["delta_train"], dtype=np.float64).ravel()
+            if dtr.size == int(train_idx.size):
+                win = 0.10  # window in log(1+delta)
+                xtr = np.log1p(np.clip(dtr, a_min=-1.0 + 1e-12, a_max=None))
+                x0 = float(np.log1p(np.clip(delta0, a_min=-1.0 + 1e-12, a_max=None)))
+                close = np.where(np.abs(xtr - x0) <= float(win))[0].astype(np.int64)
+                if close.size > 0:
+                    n_show = min(int(close.size), 12)
+                    rng = np.random.default_rng(int(args.seed) + 4242)
+                    pick = rng.choice(close, size=n_show, replace=False) if close.size > n_show else close
+                    centers_tr = grid_pos[train_idx[pick]]
+                    hits_tr = tree.query_ball_point(np.mod(centers_tr, L), r=float(sphere_radius), workers=-1)
+                    Ntr = np.zeros((int(pick.size), dlog10M.size), dtype=np.int32)
+                    for s, ids in enumerate(hits_tr):
+                        if ids:
+                            Ntr[s], _ = np.histogram(log10M[np.asarray(ids, dtype=np.int64)], bins=log10M_edges)
+                    n_tr = Ntr / (V * dlog10M[None, :])
+                    for s in range(int(n_tr.shape[0])):
+                        ax.plot(log10M_centers, n_tr[s], color="tab:green", alpha=0.25, lw=1)
+                    ax.plot([], [], color="tab:green", alpha=0.6, lw=2, label=rf"Training spheres ($|\Delta\log(1+\delta)|\leq {win}$)")
+
         ax.set_yscale("log")
         ax.set_xlabel(r"$\log_{10}(M / 10^{10}\,M_\odot)$")
         ax.set_ylabel(r"$dn/d\log_{10}M\;[\mathrm{Mpc}^{-3}]$")
-        ax.set_title(rf"Predicted HMF at $\delta_R={delta0:.3g}$")
+        ax.set_title(rf"Predicted HMF at $\delta_R={delta0:.3g}$  (sd$_{{\log n}}$ max={sd_max:.2g})")
         ax.legend(frameon=False)
         fig.savefig(outdir / "conditional_hmf_eval_hmf_at_delta.png", dpi=150)
         plt.close(fig)
