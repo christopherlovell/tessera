@@ -534,7 +534,7 @@ def main() -> None:
                     rng = np.random.default_rng(int(args.seed) + 4242)
                     pick = rng.choice(close, size=n_show, replace=False) if close.size > n_show else close
                     centers_tr = grid_pos[train_idx[pick]]
-                    hits_tr = tree.query_ball_point(np.mod(centers_tr, L), r=float(sphere_radius), workers=-1)
+                    hits_tr = tree.query_ball_point(np.mod(centers_tr, L), r=float(kernel_radius), workers=-1)
                     Ntr = np.zeros((int(pick.size), dlog10M.size), dtype=np.int32)
                     for s, ids in enumerate(hits_tr):
                         if ids:
