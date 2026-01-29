@@ -478,6 +478,49 @@ def main() -> None:
     n_lo = clo / (V * dlog10M[None, :])
     n_hi = chi / (V * dlog10M[None, :])
 
+    # Per-mass-bin predicted-vs-observed HMF scatter (one subplot per mass bin).
+    # This is like conditional_hmf_eval_counts_by_bin_scatter.png but in dn/dlog10M space.
+    ncols_hmf = 2
+    nrows_hmf = 3 if int(dlog10M.size) <= 6 else int(np.ceil(dlog10M.size / ncols_hmf))
+    fig, axes = plt.subplots(
+        nrows_hmf,
+        ncols_hmf,
+        figsize=(6.8, 2.9 * nrows_hmf),
+        constrained_layout=True,
+        sharex=False,
+        sharey=False,
+        squeeze=False,
+    )
+    sm = mpl.cm.ScalarMappable(norm=norm, cmap="viridis")
+    sm.set_array([])
+
+    # Pick a reasonable symlog linear threshold so zeros are visible but most points are log-like.
+    linthresh = float(np.nanmin(n_pred)) if np.all(np.isfinite(n_pred)) else 1e-12
+    linthresh = max(linthresh, 1e-12)
+
+    for j in range(int(dlog10M.size)):
+        ax = axes.flat[j]
+        x = np.asarray(n_pred[:, j], dtype=np.float64)
+        y = np.asarray(n_obs[:, j], dtype=np.float64)
+        ax.scatter(x, y, s=6, alpha=0.45, c=dcol, cmap="viridis", norm=norm)
+        hi = max(float(np.nanmax(x)), float(np.nanmax(y)), linthresh)
+        ax.plot([0.0, hi], [0.0, hi], color="k", lw=1, alpha=0.6)
+        ax.set_xscale("symlog", linthresh=linthresh)
+        ax.set_yscale("symlog", linthresh=linthresh)
+        ax.set_title(f"log10M={log10M_centers[j]:.2f}", fontsize=9)
+        if j % ncols_hmf == 0:
+            ax.set_ylabel(r"Observed $dn/d\log_{10}M$")
+        if j // ncols_hmf == (nrows_hmf - 1):
+            ax.set_xlabel(r"Predicted $dn/d\log_{10}M$")
+
+    for ax in axes.flat[int(dlog10M.size) :]:
+        ax.axis("off")
+
+    cbar = fig.colorbar(sm, ax=list(axes.flat), pad=0.01, shrink=0.9)
+    cbar.set_label(r"$\delta_R$")
+    fig.savefig(outdir / "conditional_hmf_eval_hmf_by_bin_scatter.png", dpi=150)
+    plt.close(fig)
+
     if args.pick_counts_by == "ll_pred":
         # For selection, treat "badness" as -log L so higher percentiles are worse fits.
         metric = -ll_pred
