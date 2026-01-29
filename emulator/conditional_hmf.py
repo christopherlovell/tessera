@@ -943,7 +943,8 @@ def train_map(
                 "Non-finite loss encountered. Re-run with `--debug-nans --no-jit --x64` and/or increase `--init-jitter`."
             )
         if int(print_every) > 0 and (i % int(print_every) == 0):
-            print(i, float(val), float(lr_t))
+            loss_per_sample = float(val) / float(S)
+            print(i, loss_per_sample, float(lr_t))
     return params
 
 
