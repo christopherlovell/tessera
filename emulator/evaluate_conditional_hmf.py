@@ -22,7 +22,8 @@ _add_repo_root_to_path()
 
 from tessera.emulator.conditional_hmf import (
     _choose_centers_stratified,
-    _rbf_kernel,
+    _kernel_cross,
+    _kernel_matrix,
     load_emulator,
     load_gridder_overdensity,
     read_swift_fof,
@@ -97,6 +98,7 @@ def predict_log_n_batch(model: dict, delta_eval: np.ndarray) -> np.ndarray:
     delta_train = jnp.asarray(model["delta_train"], dtype=dtype)
     delta_mu = float(model["delta_mu"])
     delta_sig = float(model["delta_sig"]) + 1e-12
+    gp_kernel = str(model.get("gp_kernel", "rbf")).lower().strip()
 
     amp = jnp.exp(jnp.asarray(model["log_amp"], dtype=dtype))
     ell = jnp.exp(jnp.asarray(model["log_ell"], dtype=dtype))
@@ -108,11 +110,10 @@ def predict_log_n_batch(model: dict, delta_eval: np.ndarray) -> np.ndarray:
 
     mus = []
     for k in range(Phi.shape[0]):
-        Kk = _rbf_kernel(jnp, delta_t, amp[k], ell[k], jit[k])
+        Kk = _kernel_matrix(jnp, delta_t, amp[k], ell[k], jit[k], kind=gp_kernel)
         Lk = jnp.linalg.cholesky(Kk)
         v = jsp.linalg.solve_triangular(Lk.T, Z[k], lower=False)
-        d = delta_t[:, None] - delta_eval_t[None, :]
-        k_star = (amp[k] ** 2) * jnp.exp(-0.5 * (d**2) / (ell[k] ** 2))
+        k_star = _kernel_cross(jnp, delta_t, delta_eval_t, amp[k], ell[k], kind=gp_kernel)
         mus.append(k_star.T @ v)
     mus = jnp.stack(mus, axis=0)  # (K,S_eval)
 
@@ -135,6 +136,7 @@ def predict_log_n_batch_with_var(model: dict, delta_eval: np.ndarray) -> tuple[n
     delta_train = jnp.asarray(model["delta_train"], dtype=dtype)
     delta_mu = float(model["delta_mu"])
     delta_sig = float(model["delta_sig"]) + 1e-12
+    gp_kernel = str(model.get("gp_kernel", "rbf")).lower().strip()
 
     amp = jnp.exp(jnp.asarray(model["log_amp"], dtype=dtype))
     ell = jnp.exp(jnp.asarray(model["log_ell"], dtype=dtype))
@@ -147,11 +149,10 @@ def predict_log_n_batch_with_var(model: dict, delta_eval: np.ndarray) -> tuple[n
     mus = []
     vars_a = []
     for k in range(Phi.shape[0]):
-        Kk = _rbf_kernel(jnp, delta_t, amp[k], ell[k], jit[k])
+        Kk = _kernel_matrix(jnp, delta_t, amp[k], ell[k], jit[k], kind=gp_kernel)
         Lk = jnp.linalg.cholesky(Kk)
         v = jsp.linalg.solve_triangular(Lk.T, Z[k], lower=False)
-        d = delta_t[:, None] - delta_eval_t[None, :]
-        k_star = (amp[k] ** 2) * jnp.exp(-0.5 * (d**2) / (ell[k] ** 2))
+        k_star = _kernel_cross(jnp, delta_t, delta_eval_t, amp[k], ell[k], kind=gp_kernel)
         mus.append(k_star.T @ v)
 
         # Latent-function predictive variance: amp^2 - k_*^T K^{-1} k_*
@@ -210,10 +211,11 @@ def gp_health(model: dict) -> dict[str, np.ndarray]:
     amp = jnp.exp(jnp.asarray(model["log_amp"], dtype=dtype))
     ell = jnp.exp(jnp.asarray(model["log_ell"], dtype=dtype))
     jit = jnp.exp(jnp.asarray(model["log_jitter"], dtype=dtype))
+    gp_kernel = str(model.get("gp_kernel", "rbf")).lower().strip()
 
     mins = []
     for k in range(int(amp.shape[0])):
-        Kk = _rbf_kernel(jnp, delta_t, amp[k], ell[k], jit[k])
+        Kk = _kernel_matrix(jnp, delta_t, amp[k], ell[k], jit[k], kind=gp_kernel)
         Lk = jnp.linalg.cholesky(Kk)
         mins.append(jnp.min(jnp.diag(Lk)))
     return {

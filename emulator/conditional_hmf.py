@@ -775,6 +775,56 @@ def _rbf_kernel(jnp, delta: "jnp.ndarray", amp: "jnp.ndarray", ell: "jnp.ndarray
     return K + jitter2 * jnp.eye(delta.shape[0], dtype=delta.dtype)
 
 
+def _matern52_kernel(jnp, delta: "jnp.ndarray", amp: "jnp.ndarray", ell: "jnp.ndarray", jitter: "jnp.ndarray"):
+    d = jnp.abs(delta[:, None] - delta[None, :])
+    r = d / ell
+    s5 = jnp.sqrt(jnp.asarray(5.0, dtype=delta.dtype))
+    K = (amp**2) * (1.0 + s5 * r + (5.0 / 3.0) * (r**2)) * jnp.exp(-s5 * r)
+    jitter2 = jitter**2 + jnp.asarray(1e-6, dtype=delta.dtype)
+    return K + jitter2 * jnp.eye(delta.shape[0], dtype=delta.dtype)
+
+
+def _kernel_matrix(
+    jnp,
+    delta: "jnp.ndarray",
+    amp: "jnp.ndarray",
+    ell: "jnp.ndarray",
+    jitter: "jnp.ndarray",
+    *,
+    kind: str,
+):
+    kind = str(kind).lower().strip()
+    if kind in {"rbf", "sqexp", "squared_exponential"}:
+        return _rbf_kernel(jnp, delta, amp, ell, jitter)
+    if kind in {"matern52", "matern_52", "matern-5/2", "matern5/2"}:
+        return _matern52_kernel(jnp, delta, amp, ell, jitter)
+    raise ValueError(f"Unsupported GP kernel: {kind!r}")
+
+
+def _kernel_cross(
+    jnp,
+    delta_train: "jnp.ndarray",
+    delta_eval: "jnp.ndarray",
+    amp: "jnp.ndarray",
+    ell: "jnp.ndarray",
+    *,
+    kind: str,
+):
+    """
+    Cross-covariance K(train, eval) without any diagonal jitter term.
+    Shapes: delta_train=(S,), delta_eval=(B,), returns (S,B).
+    """
+    kind = str(kind).lower().strip()
+    d = delta_train[:, None] - delta_eval[None, :]
+    if kind in {"rbf", "sqexp", "squared_exponential"}:
+        return (amp**2) * jnp.exp(-0.5 * (d**2) / (ell**2))
+    if kind in {"matern52", "matern_52", "matern-5/2", "matern5/2"}:
+        r = jnp.abs(d) / ell
+        s5 = jnp.sqrt(jnp.asarray(5.0, dtype=delta_train.dtype))
+        return (amp**2) * (1.0 + s5 * r + (5.0 / 3.0) * (r**2)) * jnp.exp(-s5 * r)
+    raise ValueError(f"Unsupported GP kernel: {kind!r}")
+
+
 def _poisson_loglik(jnp, jsp, N: "jnp.ndarray", lam: "jnp.ndarray"):
     return jnp.sum(N * jnp.log(lam + 1e-30) - lam - jsp.special.gammaln(N + 1.0))
 
@@ -793,6 +843,7 @@ def make_loss_fn(
     tail_top_bins: int = 0,
     tail_eps: float = 1.0,
     jit: bool = True,
+    gp_kernel: str = "rbf",
 ):
     N = jnp.asarray(N)
     V = jnp.asarray(V)
@@ -821,6 +872,7 @@ def make_loss_fn(
     tail_eps = float(tail_eps)
     if use_tail and not (tail_eps > 0.0):
         raise ValueError(f"tail_eps must be > 0 (got {tail_eps})")
+    gp_kernel = str(gp_kernel).lower().strip()
 
     def loss(params):
         amp = jnp.exp(params["log_amp"])
@@ -832,7 +884,7 @@ def make_loss_fn(
         Vvec = []
         logdet_term = 0.0
         for k in range(K):
-            Kk = _rbf_kernel(jnp, delta_t, amp[k], ell[k], jit[k])
+            Kk = _kernel_matrix(jnp, delta_t, amp[k], ell[k], jit[k], kind=gp_kernel)
             Lk = jnp.linalg.cholesky(Kk)
             zk = Z[k]
             A.append(Lk @ zk)
@@ -852,8 +904,7 @@ def make_loss_fn(
         if use_consistency:
             mus = []
             for k in range(K):
-                d = delta_t[:, None] - delta_q_t[None, :]
-                k_star = (amp[k] ** 2) * jnp.exp(-0.5 * (d**2) / (ell[k] ** 2))
+                k_star = _kernel_cross(jnp, delta_t, delta_q_t, amp[k], ell[k], kind=gp_kernel)
                 mus.append(k_star.T @ Vvec[k])
             mus = jnp.stack(mus, axis=0)  # (K,Q)
 
@@ -1009,6 +1060,7 @@ def save_emulator(
     train_gridder_file: Path | None,
     mass_basis: str | None = None,
     bspline_degree: int | None = None,
+    gp_kernel: str | None = None,
     baseline_mode: str | None = None,
     beta_tail: float | None = None,
     tail_top_bins: int | None = None,
@@ -1032,6 +1084,8 @@ def save_emulator(
                 f.attrs["mass_basis"] = str(mass_basis)
             if bspline_degree is not None:
                 f.attrs["bspline_degree"] = int(bspline_degree)
+            if gp_kernel is not None:
+                f.attrs["gp_kernel"] = str(gp_kernel)
             if baseline_mode is not None:
                 f.attrs["baseline_mode"] = str(baseline_mode)
             if beta_tail is not None:
@@ -1089,6 +1143,11 @@ def save_emulator(
                 else {}
             ),
             **(
+                {"gp_kernel": np.asarray(str(gp_kernel), dtype=np.str_)}
+                if gp_kernel is not None
+                else {}
+            ),
+            **(
                 {"baseline_mode": np.asarray(str(baseline_mode), dtype=np.str_)}
                 if baseline_mode is not None
                 else {}
@@ -1122,6 +1181,11 @@ def load_emulator(path: Path) -> dict[str, np.ndarray | float]:
                 out["mass_basis"] = str(mb)
             if "bspline_degree" in f.attrs:
                 out["bspline_degree"] = int(f.attrs["bspline_degree"])
+            if "gp_kernel" in f.attrs:
+                gk = f.attrs["gp_kernel"]
+                if isinstance(gk, bytes):
+                    gk = gk.decode("utf-8")
+                out["gp_kernel"] = str(gk)
             if "baseline_mode" in f.attrs:
                 bm = f.attrs["baseline_mode"]
                 if isinstance(bm, bytes):
@@ -1161,6 +1225,8 @@ def load_emulator(path: Path) -> dict[str, np.ndarray | float]:
         out["mass_basis"] = str(np.asarray(out["mass_basis"]).item())
     if "bspline_degree" in out:
         out["bspline_degree"] = int(np.asarray(out["bspline_degree"]).item())
+    if "gp_kernel" in out:
+        out["gp_kernel"] = str(np.asarray(out["gp_kernel"]).item())
     if "baseline_mode" in out:
         out["baseline_mode"] = str(np.asarray(out["baseline_mode"]).item())
     for k in ["beta_tail", "tail_eps"]:
@@ -1176,6 +1242,7 @@ def predict_log_n(model: dict[str, np.ndarray | float], delta: float) -> tuple[n
     log_n_base = jnp.asarray(model["log_n_base"])
     log10M_edges = np.asarray(model["log10M_edges"])
     log10M_centers = 0.5 * (log10M_edges[:-1] + log10M_edges[1:])
+    gp_kernel = str(model.get("gp_kernel", "rbf")).lower().strip()
 
     delta_mu = float(model["delta_mu"])
     delta_sig = float(model["delta_sig"]) + 1e-12
@@ -1190,11 +1257,10 @@ def predict_log_n(model: dict[str, np.ndarray | float], delta: float) -> tuple[n
 
     mu = []
     for k in range(Phi.shape[0]):
-        Kk = _rbf_kernel(jnp, delta_t, amp[k], ell[k], jit[k])
+        Kk = _kernel_matrix(jnp, delta_t, amp[k], ell[k], jit[k], kind=gp_kernel)
         Lk = jnp.linalg.cholesky(Kk)
         v = jsp.linalg.solve_triangular(Lk.T, Z[k], lower=False)
-        d = delta_t - delta_star_t
-        k_star = (amp[k] ** 2) * jnp.exp(-0.5 * (d**2) / (ell[k] ** 2))
+        k_star = _kernel_cross(jnp, delta_t, jnp.asarray([delta_star_t], dtype=delta_t.dtype), amp[k], ell[k], kind=gp_kernel)[:, 0]
         mu.append(jnp.dot(k_star, v))
     mu = jnp.stack(mu, axis=0)
 
@@ -1274,6 +1340,7 @@ def _loss_parts(
     tail_top_bins: int,
     tail_eps: float,
     params,
+    gp_kernel: str = "rbf",
 ):
     jax, jnp, jsp = _jax_imports()
     N = jnp.asarray(N)
@@ -1294,6 +1361,7 @@ def _loss_parts(
     else:
         tail_j0 = int(N.shape[1])
     tail_eps = float(tail_eps)
+    gp_kernel = str(gp_kernel).lower().strip()
 
     mu_d = jnp.mean(delta)
     sig_d = jnp.std(delta) + 1e-12
@@ -1311,7 +1379,7 @@ def _loss_parts(
     Ldiag_min = []
     logdet_term = 0.0
     for k in range(Phi.shape[0]):
-        Kk = _rbf_kernel(jnp, delta_t, amp[k], ell[k], jit[k])
+        Kk = _kernel_matrix(jnp, delta_t, amp[k], ell[k], jit[k], kind=gp_kernel)
         Lk = jnp.linalg.cholesky(Kk)
         Ldiag_min.append(jnp.min(jnp.diag(Lk)))
         logdet_term = logdet_term + jnp.sum(jnp.log(jnp.clip(jnp.diag(Lk), 1e-30)))
@@ -1416,6 +1484,13 @@ def main():
         type=int,
         default=2,
         help="Degree of the B-spline basis used when --mass-basis=bspline.",
+    )
+    tr.add_argument(
+        "--gp-kernel",
+        type=str,
+        default="rbf",
+        choices=["rbf", "matern52"],
+        help="Kernel for the GP over overdensity.",
     )
     tr.add_argument("--K", type=int, default=6, help="Number of basis modes (excluding the intercept for PCA).")
     tr.add_argument("--steps", type=int, default=5000)
@@ -1581,6 +1656,7 @@ def main():
                 tail_top_bins=tail_top_bins,
                 tail_eps=float(args.tail_eps),
                 params=params0,
+                gp_kernel=str(args.gp_kernel),
             )
             for k in ["loss", "ll", "lp", "penalty", "tail", "logdet", "lam_min", "lam_max", "log_n_min", "log_n_max", "Ldiag_min"]:
                 print(f"{k} {parts[k]:.8e}")
@@ -1599,6 +1675,7 @@ def main():
             tail_top_bins=tail_top_bins,
             tail_eps=float(args.tail_eps),
             jit=not bool(args.no_jit),
+            gp_kernel=str(args.gp_kernel),
         )
         print(
             "lr_schedule "
@@ -1634,6 +1711,7 @@ def main():
             train_gridder_file=args.gridder_file,
             mass_basis=str(args.mass_basis),
             bspline_degree=(int(args.bspline_degree) if str(args.mass_basis).lower().strip() == "bspline" else None),
+            gp_kernel=str(args.gp_kernel),
             baseline_mode=str(args.baseline),
             beta_tail=(float(args.beta_tail) if float(args.beta_tail) > 0.0 else None),
             tail_top_bins=(tail_top_bins if float(args.beta_tail) > 0.0 else None),

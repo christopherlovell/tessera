@@ -358,7 +358,7 @@ def plot_global_hmf_comparison(
 
 def _predict_log_n_batch(model: dict, delta_eval: np.ndarray) -> np.ndarray:
     # Local copy of the evaluation predictor: returns log n(M|delta) for each delta.
-    from tessera.emulator.conditional_hmf import _rbf_kernel
+    from tessera.emulator.conditional_hmf import _kernel_cross, _kernel_matrix
 
     dtype = jnp.float64 if bool(jax.config.read("jax_enable_x64")) else jnp.float32
     Phi = jnp.asarray(model["Phi"], dtype=dtype)
@@ -371,17 +371,17 @@ def _predict_log_n_batch(model: dict, delta_eval: np.ndarray) -> np.ndarray:
     ell = jnp.exp(jnp.asarray(model["log_ell"], dtype=dtype))
     jit = jnp.exp(jnp.asarray(model["log_jitter"], dtype=dtype))
     Z = jnp.asarray(model["Z"], dtype=dtype)
+    gp_kernel = str(model.get("gp_kernel", "rbf")).lower().strip()
 
     delta_t = (delta_train - delta_mu) / delta_sig
     delta_eval_t = (jnp.asarray(delta_eval, dtype=dtype) - delta_mu) / delta_sig
 
     mus = []
     for k in range(Phi.shape[0]):
-        Kk = _rbf_kernel(jnp, delta_t, amp[k], ell[k], jit[k])
+        Kk = _kernel_matrix(jnp, delta_t, amp[k], ell[k], jit[k], kind=gp_kernel)
         Lk = jnp.linalg.cholesky(Kk)
         v = jsp.linalg.solve_triangular(Lk.T, Z[k], lower=False)
-        d = delta_t[:, None] - delta_eval_t[None, :]
-        k_star = (amp[k] ** 2) * jnp.exp(-0.5 * (d**2) / (ell[k] ** 2))
+        k_star = _kernel_cross(jnp, delta_t, delta_eval_t, amp[k], ell[k], kind=gp_kernel)
         mus.append(k_star.T @ v)
     mus = jnp.stack(mus, axis=0)  # (K, S_eval)
 
@@ -395,7 +395,7 @@ def _gp_posterior_cache(model: dict) -> dict[str, object]:
 
     This avoids recomputing Cholesky factors for every delta batch when integrating.
     """
-    from tessera.emulator.conditional_hmf import _rbf_kernel
+    from tessera.emulator.conditional_hmf import _kernel_matrix
 
     dtype = jnp.float64 if bool(jax.config.read("jax_enable_x64")) else jnp.float32
     Phi = jnp.asarray(model["Phi"], dtype=dtype)
@@ -408,13 +408,14 @@ def _gp_posterior_cache(model: dict) -> dict[str, object]:
     ell = jnp.exp(jnp.asarray(model["log_ell"], dtype=dtype))
     jit = jnp.exp(jnp.asarray(model["log_jitter"], dtype=dtype))
     Z = jnp.asarray(model["Z"], dtype=dtype)
+    gp_kernel = str(model.get("gp_kernel", "rbf")).lower().strip()
 
     delta_t = (delta_train - delta_mu) / delta_sig
 
     Ls = []
     vs = []
     for k in range(Phi.shape[0]):
-        Kk = _rbf_kernel(jnp, delta_t, amp[k], ell[k], jit[k])
+        Kk = _kernel_matrix(jnp, delta_t, amp[k], ell[k], jit[k], kind=gp_kernel)
         Lk = jnp.linalg.cholesky(Kk)
         v = jsp.linalg.solve_triangular(Lk.T, Z[k], lower=False)
         Ls.append(Lk)
@@ -431,6 +432,7 @@ def _gp_posterior_cache(model: dict) -> dict[str, object]:
         "amp": amp,
         "ell": ell,
         "jit": jit,
+        "gp_kernel": gp_kernel,
         "Ls": tuple(Ls),
         "vs": tuple(vs),
     }
@@ -456,6 +458,7 @@ def _predict_log_n_batch_mean_var(cache: dict[str, object], delta_eval: np.ndarr
     ell = cache["ell"]  # type: ignore[assignment]
     Ls = cache["Ls"]  # type: ignore[assignment]
     vs = cache["vs"]  # type: ignore[assignment]
+    gp_kernel = str(cache.get("gp_kernel", "rbf")).lower().strip()
 
     delta_eval_t = (jnp.asarray(delta_eval, dtype=dtype) - delta_mu) / delta_sig
 
@@ -464,8 +467,8 @@ def _predict_log_n_batch_mean_var(cache: dict[str, object], delta_eval: np.ndarr
     for k in range(Phi.shape[0]):
         Lk = Ls[k]
         v = vs[k]
-        d = delta_t[:, None] - delta_eval_t[None, :]
-        k_star = (amp[k] ** 2) * jnp.exp(-0.5 * (d**2) / (ell[k] ** 2))
+        from tessera.emulator.conditional_hmf import _kernel_cross
+        k_star = _kernel_cross(jnp, delta_t, delta_eval_t, amp[k], ell[k], kind=gp_kernel)
         mu_k = k_star.T @ v
 
         w = jsp.linalg.solve_triangular(Lk, k_star, lower=True)
