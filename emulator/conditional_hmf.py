@@ -844,6 +844,7 @@ def make_loss_fn(
     tail_eps: float = 1.0,
     jit: bool = True,
     gp_kernel: str = "rbf",
+    zero_bin_lam_weight: float = 1.0,
 ):
     N = jnp.asarray(N)
     V = jnp.asarray(V)
@@ -873,6 +874,9 @@ def make_loss_fn(
     if use_tail and not (tail_eps > 0.0):
         raise ValueError(f"tail_eps must be > 0 (got {tail_eps})")
     gp_kernel = str(gp_kernel).lower().strip()
+    zero_w = float(zero_bin_lam_weight)
+    if not np.isfinite(zero_w) or zero_w <= 0.0:
+        raise ValueError(f"zero_bin_lam_weight must be finite and > 0 (got {zero_w})")
 
     def loss(params):
         amp = jnp.exp(params["log_amp"])
@@ -896,6 +900,10 @@ def make_loss_fn(
         log_n = log_n_base[None, :] + (A.T @ Phi)
         lam = V[:, None] * dlog10M[None, :] * jnp.exp(log_n)
         ll = _poisson_loglik(jnp, jsp, N, lam)
+        if zero_w != 1.0:
+            # Extra penalty for "leakage": overpredicting expected counts in bins with observed N=0.
+            # In a Poisson model, N=0 contributes -lam to log-likelihood; multiply this term by zero_w.
+            ll = ll - (zero_w - 1.0) * jnp.sum(lam * (N == 0))
         # Important: include the Jacobian term for MAP over hyperparameters.
         # With a = L z, log p(a|theta) = -0.5||z||^2 - sum(log diag(L)) + const.
         lp = -0.5 * jnp.sum(Z**2) - logdet_term
@@ -1341,6 +1349,7 @@ def _loss_parts(
     tail_eps: float,
     params,
     gp_kernel: str = "rbf",
+    zero_bin_lam_weight: float = 1.0,
 ):
     jax, jnp, jsp = _jax_imports()
     N = jnp.asarray(N)
@@ -1362,6 +1371,9 @@ def _loss_parts(
         tail_j0 = int(N.shape[1])
     tail_eps = float(tail_eps)
     gp_kernel = str(gp_kernel).lower().strip()
+    zero_w = float(zero_bin_lam_weight)
+    if not np.isfinite(zero_w) or zero_w <= 0.0:
+        raise ValueError(f"zero_bin_lam_weight must be finite and > 0 (got {zero_w})")
 
     mu_d = jnp.mean(delta)
     sig_d = jnp.std(delta) + 1e-12
@@ -1393,6 +1405,8 @@ def _loss_parts(
     log_n = log_n_base[None, :] + (A.T @ Phi)
     lam = V[:, None] * dlog10M[None, :] * jnp.exp(log_n)
     ll = _poisson_loglik(jnp, jsp, N, lam)
+    if zero_w != 1.0:
+        ll = ll - (zero_w - 1.0) * jnp.sum(lam * (N == 0))
     lp = -0.5 * jnp.sum(Z**2) - logdet_term
 
     penalty = 0.0
@@ -1491,6 +1505,13 @@ def main():
         default="rbf",
         choices=["rbf", "matern52"],
         help="Kernel for the GP over overdensity.",
+    )
+    tr.add_argument(
+        "--zero-bin-lam-weight",
+        type=float,
+        default=1.0,
+        help="Multiply the Poisson -lambda term in bins with observed N=0 by this factor. "
+        "Values >1 penalize 'leakage' (predicting nonzero expected counts where none are observed).",
     )
     tr.add_argument("--K", type=int, default=6, help="Number of basis modes (excluding the intercept for PCA).")
     tr.add_argument("--steps", type=int, default=5000)
@@ -1657,6 +1678,7 @@ def main():
                 tail_eps=float(args.tail_eps),
                 params=params0,
                 gp_kernel=str(args.gp_kernel),
+                zero_bin_lam_weight=float(args.zero_bin_lam_weight),
             )
             for k in ["loss", "ll", "lp", "penalty", "tail", "logdet", "lam_min", "lam_max", "log_n_min", "log_n_max", "Ldiag_min"]:
                 print(f"{k} {parts[k]:.8e}")
@@ -1676,6 +1698,7 @@ def main():
             tail_eps=float(args.tail_eps),
             jit=not bool(args.no_jit),
             gp_kernel=str(args.gp_kernel),
+            zero_bin_lam_weight=float(args.zero_bin_lam_weight),
         )
         print(
             "lr_schedule "
