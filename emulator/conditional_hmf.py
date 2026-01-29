@@ -1851,13 +1851,13 @@ def main():
         "--kernel-radius-1",
         type=float,
         default=None,
-        help="First overdensity kernel radius (Mpc). Default: infer the smallest available KernelRadius.",
+        help="First overdensity kernel radius (Mpc). Default: use the sphere radius (--kernel-radius).",
     )
     tr.add_argument(
         "--kernel-radius-2",
         type=float,
         default=None,
-        help="Second overdensity kernel radius (Mpc). Default: infer the second-smallest available KernelRadius.",
+        help="Second overdensity kernel radius (Mpc). Default: infer the smallest available KernelRadius > --kernel-radius-1.",
     )
     tr.add_argument("--n-spheres", type=int, default=512)
     tr.add_argument(
